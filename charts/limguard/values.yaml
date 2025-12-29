@@ -6,4 +6,8 @@ image:
   tag: latest
   pullSecrets: []
 
-ipOverrides: []
+ipOverrides:
+  - ip: 10.200.0.1
+    node: eu-hel1-5-staging
+  - ip: 10.200.0.2
+    node: eu-staging-m22-dffc

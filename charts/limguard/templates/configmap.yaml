@@ -6,7 +6,7 @@ metadata:
   labels:
     app.kubernetes.io/name: limguard
     app.kubernetes.io/part-of: limguard
-{{- if not (empty .Values.ipOverrides) }}
+{{- if .Values.ipOverrides }}
 data:
 {{- range .Values.ipOverrides }}
   {{ .ip | quote }}: {{ .node | quote }}
