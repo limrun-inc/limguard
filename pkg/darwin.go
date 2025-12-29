@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +61,10 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, log
 	).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("failed to configure WireGuard: %s: %w", string(out), err)
 	}
+	// Set MTU like wg-quick: default interface MTU minus 80 bytes for WireGuard overhead
+	if err := nm.setMTU(); err != nil {
+		log.Info("failed to set MTU, using default", "error", err)
+	}
 	if out, err := exec.Command("ifconfig", interfaceName, "up").CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("failed to bring interface up: %s: %w", string(out), err)
 	}
@@ -75,12 +81,11 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, log
 }
 
 // SetWireguardIP sets the IP address on the WireGuard interface.
+// ip can be in CIDR notation (e.g., "10.0.0.1/24") or just an IP (e.g., "10.0.0.1").
 func (nm *DarwinNetworkManager) SetWireguardIP(ip string) error {
-	// On macOS, we use ifconfig to set the address
-	// Format: ifconfig <interface> inet <local_ip> <remote_ip> netmask 255.255.255.255
-	// For point-to-point interfaces, we set the same IP for both local and remote
-
-	// First check if the address is already set
+	// On macOS, we use ifconfig similar to wg-quick:
+	// ifconfig <interface> inet <ip/cidr> <ip> alias
+	// The "alias" keyword allows multiple addresses on the interface.
 	out, err := exec.Command("ifconfig", nm.InterfaceName).Output()
 	if err != nil {
 		return fmt.Errorf("failed to get interface info: %w", err)
@@ -90,10 +95,7 @@ func (nm *DarwinNetworkManager) SetWireguardIP(ip string) error {
 	if strings.Contains(string(out), ip) {
 		return nil // Already set, idempotent success
 	}
-
-	// Set the address using ifconfig
-	// For WireGuard on macOS, we set it as a point-to-point interface
-	if out, err := exec.Command("ifconfig", nm.InterfaceName, "inet", ip, ip, "netmask", "255.255.255.255").CombinedOutput(); err != nil {
+	if out, err := exec.Command("ifconfig", nm.InterfaceName, "inet", ip+"/32", ip, "alias").CombinedOutput(); err != nil {
 		outStr := string(out)
 		// Handle case where address might already exist
 		if strings.Contains(strings.ToLower(outStr), "exists") ||
@@ -256,4 +258,57 @@ func isIPAddress(s string) bool {
 		return false
 	}
 	return strings.Contains(s, ".")
+}
+
+// setMTU sets the MTU on the WireGuard interface.
+// Like wg-quick, it calculates MTU as (default interface MTU - 80) to account for WireGuard overhead.
+func (nm *DarwinNetworkManager) setMTU() error {
+	// Find the default route's interface
+	out, err := exec.Command("netstat", "-nr", "-f", "inet").Output()
+	if err != nil {
+		return fmt.Errorf("failed to get routing table: %w", err)
+	}
+
+	var defaultIface string
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 4 && fields[0] == "default" {
+			// On macOS netstat -nr -f inet output:
+			// Destination        Gateway            Flags               Netif Expire
+			// default            192.168.1.1        UGScg                 en0
+			defaultIface = fields[3]
+			break
+		}
+	}
+
+	if defaultIface == "" {
+		return fmt.Errorf("could not find default interface")
+	}
+
+	// Get the MTU of the default interface
+	out, err = exec.Command("ifconfig", defaultIface).Output()
+	if err != nil {
+		return fmt.Errorf("failed to get default interface info: %w", err)
+	}
+
+	mtuRegex := regexp.MustCompile(`mtu\s+(\d+)`)
+	matches := mtuRegex.FindStringSubmatch(string(out))
+	mtu := 1500 // Default fallback
+	if len(matches) >= 2 {
+		if parsed, err := strconv.Atoi(matches[1]); err == nil && parsed > 0 {
+			mtu = parsed
+		}
+	}
+
+	// Subtract 80 bytes for WireGuard overhead (same as wg-quick)
+	wgMTU := mtu - 80
+
+	// Set MTU on our interface
+	if out, err := exec.Command("ifconfig", nm.InterfaceName, "mtu", strconv.Itoa(wgMTU)).CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to set MTU: %s: %w", string(out), err)
+	}
+
+	nm.log.Info("set MTU", "interface", nm.InterfaceName, "mtu", wgMTU, "basedOn", defaultIface, "originalMTU", mtu)
+	return nil
 }

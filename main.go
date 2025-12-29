@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -50,12 +51,6 @@ func main() {
 	flag.StringVar(&interfaceName, "interface-name", getEnvOrDefault("INTERFACE_NAME", defaultInterfaceName), "The WireGuard interface name.")
 	flag.IntVar(&listenPort, "listen-port", 51820, "The WireGuard listen port.")
 	flag.Parse()
-
-	if nodeName == "" {
-		setupLog.Error(nil, "node-name is required (set via --node-name or NODE_NAME env var)")
-		os.Exit(1)
-	}
-
 	var zlog logr.Logger
 	if debug {
 		zlog = zap.New(
@@ -66,6 +61,13 @@ func main() {
 		zlog = zap.New(
 			zap.UseDevMode(false),
 		)
+	}
+	klog.SetLogger(zlog)
+	defer klog.Flush()
+	ctrl.SetLogger(zlog)
+	if nodeName == "" {
+		setupLog.Error(nil, "node-name is required (set via --node-name or NODE_NAME env var)")
+		os.Exit(1)
 	}
 	log := logging.NewLogrLogger(zlog)
 	log.Info("initializing",
