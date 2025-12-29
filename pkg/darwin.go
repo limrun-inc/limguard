@@ -19,6 +19,7 @@ import (
 type DarwinNetworkManager struct {
 	// InterfaceName is the WireGuard interface name (e.g., "utun5")
 	InterfaceName string
+	WireguardIP   string
 
 	peerIPList   map[string]*Peer
 	peerIPListMu *sync.RWMutex
@@ -104,6 +105,7 @@ func (nm *DarwinNetworkManager) SetWireguardIP(ip string) error {
 		}
 		return fmt.Errorf("failed to set address: %s: %w", outStr, err)
 	}
+	nm.WireguardIP = ip
 	return nil
 }
 
@@ -138,8 +140,6 @@ func (nm *DarwinNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint
 			}
 		}
 		nm.log.Info("added route for peer", "peerIP", wireguardIp)
-	} else {
-		nm.log.Debug("route already exists for peer", "peerIP", wireguardIp, "output", string(out))
 	}
 
 	nm.peerIPListMu.Lock()
@@ -219,6 +219,9 @@ func (nm *DarwinNetworkManager) syncAllowedIPs() {
 
 	wg := &sync.WaitGroup{}
 	for peerIP := range peerCIDRs {
+		if peerIP == nm.WireguardIP {
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
