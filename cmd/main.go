@@ -46,7 +46,7 @@ func main() {
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging.")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "The name of the node this instance is running on.")
 	flag.StringVar(&nodeIPCidr, "node-ip-cidr", getEnvOrDefault("NODE_IP_CIDR", "10.200.0.0/24"), "The CIDR range to allocate WireGuard IPs from.")
-	flag.StringVar(&leaseNamespace, "lease-namespace", getEnvOrDefault("LEASE_NAMESPACE", "kube-system"), "The namespace to create Lease objects for IP coordination.")
+	flag.StringVar(&leaseNamespace, "lease-namespace", getEnvOrDefault("LEASE_NAMESPACE", "kube-node-lease"), "The namespace to create Lease objects for IP coordination.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&interfaceName, "interface-name", getEnvOrDefault("INTERFACE_NAME", defaultInterfaceName), "The WireGuard interface name.")
 	flag.IntVar(&listenPort, "listen-port", 51820, "The WireGuard listen port.")
