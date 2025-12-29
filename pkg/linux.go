@@ -96,7 +96,7 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wir
 			IP:   ip,
 			Mask: net.CIDRMask(32, 32),
 		},
-		Protocol: unix.RTPROT_STATIC,
+		Protocol: unix.RT_SCOPE_LINK,
 	}
 	if err := netlink.RouteReplace(route); err != nil {
 		return nil, fmt.Errorf("failed to add route: %w", err)
