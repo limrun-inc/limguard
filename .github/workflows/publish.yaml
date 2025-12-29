@@ -62,7 +62,7 @@ jobs:
 
       - name: Build for linux/amd64
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-X 'github.com/limrun-inc/limguard/version.Version=${{ steps.version.outputs.VERSION }}'" -o .work/bin/limguard-linux-amd64 main.go
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-X 'github.com/limrun-inc/limguard/version.Version=${{ steps.version.outputs.VERSION }}'" -o .work/bin/limguard-linux-amd64 cmd/main.go
 
       - name: Login to Github Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
