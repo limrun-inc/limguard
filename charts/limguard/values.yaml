@@ -1,0 +1,7 @@
+nodeCIDR: 10.200.0.0/24
+debug: false
+
+image:
+  repository: ghcr.io/limrun-inc/limguard
+  tag: latest
+  pullSecrets: []
