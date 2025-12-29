@@ -5,6 +5,8 @@ package limguard
 import (
 	"context"
 	"fmt"
+	"net"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -13,12 +15,16 @@ import (
 	"time"
 
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
+	"golang.zx2c4.com/wireguard/wgctrl"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// DarwinNetworkManager implements NetworkManager for macOS using ifconfig, route, and wg commands.
+// DarwinNetworkManager implements NetworkManager for macOS using ifconfig, route, and wgctrl.
 type DarwinNetworkManager struct {
 	InterfaceName string
 	WireguardIP   string
+
+	wgClient *wgctrl.Client
 
 	peerIPList   map[string]*Peer
 	peerIPListMu *sync.RWMutex
@@ -54,21 +60,44 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wir
 			return nil, fmt.Errorf("failed to set address: %s: %w", outStr, err)
 		}
 	}
-	if out, err := exec.Command("/opt/homebrew/bin/wg", "set", interfaceName,
-		"listen-port", fmt.Sprintf("%d", listenPort),
-		"private-key", privateKeyPath,
-	).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("failed to configure WireGuard: %s: %w", string(out), err)
+
+	// Read private key from file
+	privateKeyBytes, err := os.ReadFile(privateKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read private key: %w", err)
 	}
+	privateKey, err := wgtypes.ParseKey(strings.TrimSpace(string(privateKeyBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
+
+	// Create wgctrl client
+	wgClient, err := wgctrl.New()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create wgctrl client: %w", err)
+	}
+
+	// Configure WireGuard interface
+	if err := wgClient.ConfigureDevice(interfaceName, wgtypes.Config{
+		PrivateKey: &privateKey,
+		ListenPort: &listenPort,
+	}); err != nil {
+		wgClient.Close()
+		return nil, fmt.Errorf("failed to configure WireGuard: %w", err)
+	}
+
 	// Set MTU like wg-quick: default interface MTU minus 80 bytes for WireGuard overhead
 	if err := setMTU(interfaceName); err != nil {
+		wgClient.Close()
 		return nil, fmt.Errorf("failed to set MTU: %w", err)
 	}
 	if out, err := exec.Command("ifconfig", interfaceName, "up").CombinedOutput(); err != nil {
+		wgClient.Close()
 		return nil, fmt.Errorf("failed to bring interface up: %s: %w", string(out), err)
 	}
 	nm := &DarwinNetworkManager{
 		InterfaceName: interfaceName,
+		wgClient:      wgClient,
 		peerIPList:    make(map[string]*Peer),
 		peerIPListMu:  &sync.RWMutex{},
 		WireguardIP:   wireguardIp,
@@ -85,15 +114,49 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wir
 
 // SetPeer configures a WireGuard peer and adds a route for its allowed IPs.
 func (nm *DarwinNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wireguardIp string) error {
-	if out, err := exec.CommandContext(ctx, "/opt/homebrew/bin/wg", "show", nm.InterfaceName, "peers").CombinedOutput(); err == nil && !strings.Contains(string(out), publicKey) {
+	pubKey, err := wgtypes.ParseKey(publicKey)
+	if err != nil {
+		return fmt.Errorf("failed to parse public key: %w", err)
+	}
+
+	// Check if peer already exists
+	device, err := nm.wgClient.Device(nm.InterfaceName)
+	if err != nil {
+		return fmt.Errorf("failed to get device: %w", err)
+	}
+
+	peerExists := false
+	for _, peer := range device.Peers {
+		if peer.PublicKey == pubKey {
+			peerExists = true
+			break
+		}
+	}
+
+	if !peerExists {
 		// The first time we add this peer, so we configure only its own peer IP.
-		if out, err := exec.Command("/opt/homebrew/bin/wg", "set", nm.InterfaceName,
-			"peer", publicKey,
-			"endpoint", endpoint,
-			"allowed-ips", wireguardIp+"/32",
-			"persistent-keepalive", "25",
-		).CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to set peer: %s: %w", string(out), err)
+		udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
+		if err != nil {
+			return fmt.Errorf("failed to resolve endpoint: %w", err)
+		}
+
+		_, allowedIPNet, err := net.ParseCIDR(wireguardIp + "/32")
+		if err != nil {
+			return fmt.Errorf("failed to parse allowed IP: %w", err)
+		}
+
+		keepalive := 25 * time.Second
+		if err := nm.wgClient.ConfigureDevice(nm.InterfaceName, wgtypes.Config{
+			Peers: []wgtypes.PeerConfig{
+				{
+					PublicKey:                   pubKey,
+					Endpoint:                    udpAddr,
+					AllowedIPs:                  []net.IPNet{*allowedIPNet},
+					PersistentKeepaliveInterval: &keepalive,
+				},
+			},
+		}); err != nil {
+			return fmt.Errorf("failed to set peer: %w", err)
 		}
 		nm.log.Info("added peer for the first time", "publicKey", publicKey, "endpoint", endpoint)
 	}
@@ -134,8 +197,6 @@ func (nm *DarwinNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint
 // syncAllowedIPs lists routes, builds a map of CIDRs to peer IPs, and updates
 // the allowedIPs of WireGuard peers accordingly.
 func (nm *DarwinNetworkManager) syncAllowedIPs() {
-	ctx := context.Background()
-
 	// On macOS, use netstat -rn to get routing table
 	out, err := exec.Command("netstat", "-rn").Output()
 	if err != nil {
@@ -208,24 +269,54 @@ func (nm *DarwinNetworkManager) syncAllowedIPs() {
 				return
 			}
 			nm.peerIPListMu.Unlock()
-			allowedIpCidrs := make([]string, len(peerCIDRs[peerIP])+1)
-			allowedIpCidrs[0] = peer.WireguardIP + "/32"
-			i := 1
-			for cidr := range peerCIDRs[peerIP] {
-				allowedIpCidrs[i] = cidr
-				i++
-			}
-			allowedIpsStr := strings.Join(allowedIpCidrs, ",")
-			out, err := exec.CommandContext(ctx, "/opt/homebrew/bin/wg", "set", nm.InterfaceName,
-				"peer", peer.PublicKey,
-				"endpoint", peer.Endpoint,
-				"allowed-ips", allowedIpsStr,
-			).CombinedOutput()
+
+			pubKey, err := wgtypes.ParseKey(peer.PublicKey)
 			if err != nil {
-				nm.log.Info("failed to update peer allowed IPs", "peerIP", peerIP, "err", string(out))
+				nm.log.Info("failed to parse public key", "peerIP", peerIP, "err", err)
 				return
 			}
-			nm.log.Debug("updated peer allowed IPs", "peerIP", peerIP, "allowedIPs", allowedIpsStr)
+
+			udpAddr, err := net.ResolveUDPAddr("udp", peer.Endpoint)
+			if err != nil {
+				nm.log.Info("failed to resolve endpoint", "peerIP", peerIP, "err", err)
+				return
+			}
+
+			// Build allowed IPs list
+			allowedIPs := make([]net.IPNet, 0, len(peerCIDRs[peerIP])+1)
+			_, peerIPNet, err := net.ParseCIDR(peer.WireguardIP + "/32")
+			if err != nil {
+				nm.log.Info("failed to parse peer wireguard IP", "peerIP", peerIP, "err", err)
+				return
+			}
+			allowedIPs = append(allowedIPs, *peerIPNet)
+
+			allowedIPStrs := []string{peer.WireguardIP + "/32"}
+			for cidr := range peerCIDRs[peerIP] {
+				_, ipNet, err := net.ParseCIDR(cidr)
+				if err != nil {
+					nm.log.Info("failed to parse CIDR", "cidr", cidr, "err", err)
+					continue
+				}
+				allowedIPs = append(allowedIPs, *ipNet)
+				allowedIPStrs = append(allowedIPStrs, cidr)
+			}
+
+			if err := nm.wgClient.ConfigureDevice(nm.InterfaceName, wgtypes.Config{
+				Peers: []wgtypes.PeerConfig{
+					{
+						PublicKey:         pubKey,
+						UpdateOnly:        true,
+						Endpoint:          udpAddr,
+						ReplaceAllowedIPs: true,
+						AllowedIPs:        allowedIPs,
+					},
+				},
+			}); err != nil {
+				nm.log.Info("failed to update peer allowed IPs", "peerIP", peerIP, "err", err)
+				return
+			}
+			nm.log.Debug("updated peer allowed IPs", "peerIP", peerIP, "allowedIPs", strings.Join(allowedIPStrs, ","))
 		}()
 	}
 	wg.Wait()
