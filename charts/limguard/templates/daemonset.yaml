@@ -44,8 +44,8 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
           volumeMounts:
-            - name: wireguard-config
-              mountPath: /etc/wireguard
+            - name: privatekey-dir
+              mountPath: /etc/limguard
             - name: lib-modules
               mountPath: /lib/modules
               readOnly: true
@@ -69,9 +69,9 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
       volumes:
-        - name: wireguard-config
+        - name: privatekey-dir
           hostPath:
-            path: /etc/wireguard
+            path: /etc/limguard
             type: DirectoryOrCreate
         - name: lib-modules
           hostPath:

@@ -67,13 +67,10 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wir
 		},
 	}
 	if err := netlink.AddrAdd(link, addr); err != nil {
-		// Ignore if address already exists
 		if !strings.Contains(err.Error(), "exists") {
 			return nil, fmt.Errorf("failed to add address: %w", err)
 		}
 	}
-
-	// Read private key from file
 	privateKeyBytes, err := os.ReadFile(privateKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read private key: %w", err)
@@ -82,14 +79,10 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wir
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse private key: %w", err)
 	}
-
-	// Create wgctrl client
 	wgClient, err := wgctrl.New()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create wgctrl client: %w", err)
 	}
-
-	// Configure WireGuard interface
 	if err := wgClient.ConfigureDevice(interfaceName, wgtypes.Config{
 		PrivateKey: &privateKey,
 		ListenPort: &listenPort,
@@ -97,13 +90,10 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wir
 		wgClient.Close()
 		return nil, fmt.Errorf("failed to configure WireGuard: %w", err)
 	}
-
-	// Bring interface up
 	if err := netlink.LinkSetUp(link); err != nil {
 		wgClient.Close()
 		return nil, fmt.Errorf("failed to bring interface up: %w", err)
 	}
-
 	nm := &LinuxNetworkManager{
 		InterfaceName: interfaceName,
 		WireguardIP:   wireguardIp,
