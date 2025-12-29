@@ -7,23 +7,25 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// LinuxNetworkManager implements NetworkManager for Linux using ip command and wgctrl.
+// LinuxNetworkManager implements NetworkManager for Linux using netlink and wgctrl.
 type LinuxNetworkManager struct {
 	// InterfaceName is the WireGuard interface name (e.g., "wg0")
 	InterfaceName string
 	WireguardIP   string
 
 	wgClient *wgctrl.Client
+	link     netlink.Link
 
 	peerIPList   map[string]*Peer
 	peerIPListMu *sync.RWMutex
@@ -35,18 +37,39 @@ type LinuxNetworkManager struct {
 // It creates the WireGuard interface, configures it with the private key and listen port,
 // and brings it up. This should be called once at startup.
 func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wireguardIp string, log logging.Logger) (*LinuxNetworkManager, error) {
-	if _, err := exec.Command("ip", "link", "show", interfaceName).Output(); err != nil {
-		if out, err := exec.Command("ip", "link", "add", interfaceName, "type", "wireguard").CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("failed to create interface: %s: %w", string(out), err)
+	// Check if interface exists, create if not
+	link, err := netlink.LinkByName(interfaceName)
+	if err != nil {
+		// Interface doesn't exist, create it
+		wgLink := &netlink.Wireguard{
+			LinkAttrs: netlink.LinkAttrs{
+				Name: interfaceName,
+			},
+		}
+		if err := netlink.LinkAdd(wgLink); err != nil {
+			return nil, fmt.Errorf("failed to create interface: %w", err)
+		}
+		link, err = netlink.LinkByName(interfaceName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get interface after creation: %w", err)
 		}
 	}
-	expectedAddr := fmt.Sprintf("%s/32", wireguardIp)
-	out, err := exec.Command("ip", "addr", "add", expectedAddr, "dev", interfaceName).CombinedOutput()
-	if err != nil {
-		outStr := string(out)
-		if !strings.Contains(strings.ToLower(outStr), "exists") &&
-			!strings.Contains(strings.ToLower(outStr), "already assigned") {
-			return nil, fmt.Errorf("failed to add address: %s: %w", outStr, err)
+
+	// Add IP address to interface
+	ip := net.ParseIP(wireguardIp)
+	if ip == nil {
+		return nil, fmt.Errorf("failed to parse wireguard IP: %s", wireguardIp)
+	}
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{
+			IP:   ip,
+			Mask: net.CIDRMask(32, 32),
+		},
+	}
+	if err := netlink.AddrAdd(link, addr); err != nil {
+		// Ignore if address already exists
+		if !strings.Contains(err.Error(), "exists") {
+			return nil, fmt.Errorf("failed to add address: %w", err)
 		}
 	}
 
@@ -75,14 +98,17 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wir
 		return nil, fmt.Errorf("failed to configure WireGuard: %w", err)
 	}
 
-	if out, err := exec.Command("ip", "link", "set", interfaceName, "up").CombinedOutput(); err != nil {
+	// Bring interface up
+	if err := netlink.LinkSetUp(link); err != nil {
 		wgClient.Close()
-		return nil, fmt.Errorf("failed to bring interface up: %s: %w", string(out), err)
+		return nil, fmt.Errorf("failed to bring interface up: %w", err)
 	}
+
 	nm := &LinuxNetworkManager{
 		InterfaceName: interfaceName,
 		WireguardIP:   wireguardIp,
 		wgClient:      wgClient,
+		link:          link,
 		peerIPList:    make(map[string]*Peer),
 		peerIPListMu:  &sync.RWMutex{},
 		log:           log,
@@ -145,10 +171,23 @@ func (nm *LinuxNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint,
 		nm.log.Info("added peer for the first time", "publicKey", publicKey, "endpoint", endpoint)
 	}
 
-	// Add route for the peer's allowed IPs
-	if out, err := exec.Command("ip", "route", "replace", wireguardIp+"/32", "dev", nm.InterfaceName).CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to add route: %s: %w", string(out), err)
+	// Add route for the peer's allowed IPs using netlink
+	dstIP := net.ParseIP(wireguardIp)
+	if dstIP == nil {
+		return fmt.Errorf("failed to parse peer IP: %s", wireguardIp)
 	}
+	route := &netlink.Route{
+		LinkIndex: nm.link.Attrs().Index,
+		Dst: &net.IPNet{
+			IP:   dstIP,
+			Mask: net.CIDRMask(32, 32),
+		},
+		Protocol: unix.RTPROT_STATIC,
+	}
+	if err := netlink.RouteReplace(route); err != nil {
+		return fmt.Errorf("failed to add route: %w", err)
+	}
+
 	nm.peerIPListMu.Lock()
 	defer nm.peerIPListMu.Unlock()
 	if nm.peerIPList[wireguardIp] != nil {
@@ -167,31 +206,34 @@ func (nm *LinuxNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint,
 // syncAllowedIPs lists routes, builds a map of CIDRs to peer IPs, and updates
 // the allowedIPs of WireGuard peers accordingly.
 func (nm *LinuxNetworkManager) syncAllowedIPs() {
-	out, err := exec.Command("ip", "route", "show", "dev", nm.InterfaceName).Output()
+	// Get routes for our interface using netlink
+	routes, err := netlink.RouteList(nm.link, netlink.FAMILY_V4)
 	if err != nil {
+		nm.log.Debug("failed to list routes", "error", err)
 		return
 	}
 
-	// Example line returned from ip tool:
-	// 10.244.23.0/26 via 10.200.0.18 proto bird
+	// Build a map of gateway IP to CIDRs
+	// Example route: 10.244.23.0/26 via 10.200.0.18
 	peerCIDRs := make(map[string]map[string]struct{})
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || !strings.Contains(line, "via") {
+	for _, route := range routes {
+		// Skip routes without a gateway (direct routes)
+		if route.Gw == nil {
 			continue
 		}
-		fields := strings.Split(line, " ")
-		if len(fields) < 3 {
+		if route.Dst == nil {
 			continue
 		}
-		cidr := fields[0]
-		peerIP := fields[2]
-		if peerCIDRs[peerIP] == nil {
-			peerCIDRs[peerIP] = make(map[string]struct{})
+
+		gateway := route.Gw.String()
+		cidr := route.Dst.String()
+
+		if peerCIDRs[gateway] == nil {
+			peerCIDRs[gateway] = make(map[string]struct{})
 		}
-		peerCIDRs[peerIP][cidr] = struct{}{}
+		peerCIDRs[gateway][cidr] = struct{}{}
 	}
+
 	wg := &sync.WaitGroup{}
 	for peerIP := range peerCIDRs {
 		wg.Add(1)
