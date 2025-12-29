@@ -127,7 +127,7 @@ func (nm *LinuxNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint,
 
 	peerExists := false
 	for _, peer := range device.Peers {
-		if peer.PublicKey == pubKey {
+		if peer.PublicKey.String() == pubKey.String() {
 			peerExists = true
 			break
 		}
