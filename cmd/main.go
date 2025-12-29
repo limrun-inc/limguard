@@ -11,6 +11,7 @@ import (
 	limguard "github.com/limrun-inc/limguard/pkg"
 	"github.com/limrun-inc/limguard/version"
 	"go.uber.org/zap/zapcore"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -28,6 +29,7 @@ var (
 
 func init() {
 	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(coordinationv1.AddToScheme(scheme)) // For legacy lease migration
 }
 
 func main() {
