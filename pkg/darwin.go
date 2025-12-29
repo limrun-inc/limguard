@@ -205,6 +205,10 @@ func (nm *DarwinNetworkManager) syncAllowedIPs() {
 			continue
 		}
 
+		// netstat on macOS may abbreviate IPv4 CIDRs, e.g. "10.96.0.0/12" as "10.96/12".
+		// Expand those so wg receives a valid CIDR string.
+		cidr = expandAbbreviatedNetstatCIDR(cidr)
+
 		// Normalize CIDR - netstat might show just IP without /32
 		if !strings.Contains(cidr, "/") {
 			cidr = cidr + "/32"
@@ -218,9 +222,6 @@ func (nm *DarwinNetworkManager) syncAllowedIPs() {
 
 	wg := &sync.WaitGroup{}
 	for peerIP := range peerCIDRs {
-		if peerIP == nm.WireguardIP {
-			continue
-		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -265,6 +266,31 @@ func isIPAddress(s string) bool {
 		return false
 	}
 	return strings.Contains(s, ".")
+}
+
+// expandAbbreviatedNetstatCIDR expands macOS netstat abbreviated IPv4 CIDRs.
+// Example: "10.96/12" -> "10.96.0.0/12", "10/8" -> "10.0.0.0/8".
+// If the input doesn't look like an abbreviated IPv4 CIDR, it is returned unchanged.
+func expandAbbreviatedNetstatCIDR(cidr string) string {
+	parts := strings.Split(cidr, "/")
+	if len(parts) != 2 {
+		return cidr
+	}
+	ipPart, maskPart := parts[0], parts[1]
+	// Only handle IPv4 here. IPv6 routes in netstat output are different.
+	if strings.Contains(ipPart, ":") {
+		return cidr
+	}
+	dots := strings.Count(ipPart, ".")
+	if dots >= 3 {
+		return cidr
+	}
+	// Append ".0" until it's a full dotted quad.
+	for dots < 3 {
+		ipPart += ".0"
+		dots++
+	}
+	return ipPart + "/" + maskPart
 }
 
 // setMTU sets the MTU on the WireGuard interface.
