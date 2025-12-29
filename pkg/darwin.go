@@ -125,8 +125,8 @@ func (nm *DarwinNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint
 	// Check if route already exists using "route -n get"
 	// If the route exists, the command succeeds and shows route info
 	// If not, it fails with "not in table" or similar error
-	if out, err := exec.Command("route", "-n", "get", wireguardIp).CombinedOutput(); err != nil || !strings.Contains(string(out), wireguardIp) {
-		// Route doesn't exist or lookup failed, add it
+	if out, err := exec.Command("route", "-n", "get", wireguardIp).CombinedOutput(); err != nil ||
+		!strings.Contains(string(out), "interface: "+nm.InterfaceName) {
 		if out, err := exec.Command("route", "-n", "add", "-host", wireguardIp, "-interface", nm.InterfaceName).CombinedOutput(); err != nil {
 			outStr := string(out)
 			// Ignore "route already exists" errors (race condition)
