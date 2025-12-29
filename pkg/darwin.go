@@ -73,7 +73,6 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, log
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		for range ticker.C {
-			nm.log.Debug("syncing allowed IPs")
 			nm.syncAllowedIPs()
 		}
 	}()
