@@ -1,0 +1,136 @@
+name: Build and Push Images
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+env:
+  GO_VERSION: 1.25.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: 'true'
+      - name: Fetch history for all tags
+        run: git fetch --prune --unshallow
+      - name: Calculate version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+            VERSION="${LAST_TAG}-${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Find the Go Environment
+        id: go
+        run: |
+          echo "cache=$(go env GOCACHE)" >> $GITHUB_OUTPUT
+          echo "mod=$(go env GOMODCACHE)" >> $GITHUB_OUTPUT
+
+      - name: Cache Go Dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.go.outputs.mod }}
+          key: mod-cache-${{ hashFiles('**/go.sum') }}
+          restore-keys: mod-cache-
+
+      - name: Cache Go Build Cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.go.outputs.cache }}
+          key: build-cache-limguard-${{ hashFiles('**/go.sum') }}
+          restore-keys: build-cache-limguard-
+
+      - name: Download Dependencies
+        run: go mod download -x
+
+      - name: Build for linux/amd64
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-X 'github.com/limrun-inc/limguard/version.Version=${{ steps.version.outputs.VERSION }}'" -o .work/bin/limguard-linux-amd64 cmd/limguard/main.go
+
+      - name: Login to Github Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Generate metadata for images
+        uses: docker/metadata-action@v5
+        id: metadata
+        with:
+          images: ghcr.io/limrun-inc/limguard
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=short,prefix=
+            ${{ steps.version.outputs.VERSION }}
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6.16.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          outputs: "type=image,compression=zstd,oci-mediatypes=true"
+  chart:
+    permissions:
+      packages: write
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Fetch history for all tags
+        run: git fetch --prune --unshallow
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Calculate version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+            VERSION="${LAST_TAG}-${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "VERSION=${VERSION}"
+      - name: Install yq
+        uses: dcarbone/install-yq-action@4075b4dca348d74bd83f2bf82d30f25d7c54539b
+      - name: Push the chart
+        id: push
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          echo "Using version: ${VERSION}"
+          yq -i ".image.tag = \"${VERSION}\"" charts/limguard/values.yaml
+          CHART_VERSION="${VERSION}"
+          echo "CHART_VERSION=${CHART_VERSION}"
+          helm dependency update charts/limguard
+          helm package charts/limguard --dependency-update --version=${CHART_VERSION} --app-version=${CHART_VERSION}
+          OUT=$(set +e; helm push limguard-${CHART_VERSION}.tgz oci://ghcr.io/limrun-inc/limguard/charts 2>&1)
+          EXIT_CODE=$?
+          set -e
+          echo "${OUT}"
+          if [[ $EXIT_CODE -ne 0 ]]; then
+              exit $EXIT_CODE
+          fi
+          DIGEST=$(echo ${OUT}| sed -n 's/.*sha256:\([^ ]*\).*/sha256:\1/p')
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
