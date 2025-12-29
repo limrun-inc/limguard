@@ -37,7 +37,7 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, log
 
 	// Create interface if it doesn't exist
 	if _, err := exec.Command("ip", "link", "show", interfaceName).Output(); err != nil {
-		if out, err := exec.Command("ip", "link", "add", interfaceName, "type", "limguard").CombinedOutput(); err != nil {
+		if out, err := exec.Command("ip", "link", "add", interfaceName, "type", "wireguard").CombinedOutput(); err != nil {
 			return nil, fmt.Errorf("failed to create interface: %s: %w", string(out), err)
 		}
 	}
