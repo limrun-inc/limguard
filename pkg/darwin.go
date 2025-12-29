@@ -17,7 +17,6 @@ import (
 
 // DarwinNetworkManager implements NetworkManager for macOS using ifconfig, route, and wg commands.
 type DarwinNetworkManager struct {
-	// InterfaceName is the WireGuard interface name (e.g., "utun5")
 	InterfaceName string
 	WireguardIP   string
 
@@ -30,15 +29,7 @@ type DarwinNetworkManager struct {
 // NewNetworkManager creates a new DarwinNetworkManager.
 // It creates the WireGuard interface using wireguard-go, configures it with the private key and listen port,
 // and brings it up. This should be called once at startup.
-func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, log logging.Logger) (*DarwinNetworkManager, error) {
-	nm := &DarwinNetworkManager{
-		InterfaceName: interfaceName,
-		peerIPList:    make(map[string]*Peer),
-		peerIPListMu:  &sync.RWMutex{},
-		log:           log,
-	}
-
-	// Check if interface already exists using ifconfig
+func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wireguardIp string, log logging.Logger) (*DarwinNetworkManager, error) {
 	if _, err := exec.Command("ifconfig", interfaceName).Output(); err != nil {
 		// Interface doesn't exist, create it with wireguard-go
 		// wireguard-go creates utun interfaces on macOS
@@ -56,6 +47,13 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, log
 			return nil, fmt.Errorf("interface %s not available after wireguard-go started: %w", interfaceName, err)
 		}
 	}
+	if out, err := exec.Command("ifconfig", interfaceName, "inet", wireguardIp+"/32", wireguardIp, "alias").CombinedOutput(); err != nil {
+		outStr := string(out)
+		if !strings.Contains(strings.ToLower(outStr), "exists") &&
+			!strings.Contains(strings.ToLower(outStr), "already") {
+			return nil, fmt.Errorf("failed to set address: %s: %w", outStr, err)
+		}
+	}
 	if out, err := exec.Command("/opt/homebrew/bin/wg", "set", interfaceName,
 		"listen-port", fmt.Sprintf("%d", listenPort),
 		"private-key", privateKeyPath,
@@ -63,49 +61,26 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, log
 		return nil, fmt.Errorf("failed to configure WireGuard: %s: %w", string(out), err)
 	}
 	// Set MTU like wg-quick: default interface MTU minus 80 bytes for WireGuard overhead
-	if err := nm.setMTU(); err != nil {
-		log.Info("failed to set MTU, using default", "error", err)
+	if err := setMTU(interfaceName); err != nil {
+		return nil, fmt.Errorf("failed to set MTU: %w", err)
 	}
 	if out, err := exec.Command("ifconfig", interfaceName, "up").CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("failed to bring interface up: %s: %w", string(out), err)
 	}
-
+	nm := &DarwinNetworkManager{
+		InterfaceName: interfaceName,
+		peerIPList:    make(map[string]*Peer),
+		peerIPListMu:  &sync.RWMutex{},
+		WireguardIP:   wireguardIp,
+		log:           log,
+	}
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		for range ticker.C {
 			nm.syncAllowedIPs()
 		}
 	}()
-
 	return nm, nil
-}
-
-// SetWireguardIP sets the IP address on the WireGuard interface.
-// ip can be in CIDR notation (e.g., "10.0.0.1/24") or just an IP (e.g., "10.0.0.1").
-func (nm *DarwinNetworkManager) SetWireguardIP(ip string) error {
-	// On macOS, we use ifconfig similar to wg-quick:
-	// ifconfig <interface> inet <ip/cidr> <ip> alias
-	// The "alias" keyword allows multiple addresses on the interface.
-	out, err := exec.Command("ifconfig", nm.InterfaceName).Output()
-	if err != nil {
-		return fmt.Errorf("failed to get interface info: %w", err)
-	}
-
-	// Check if our IP is already configured
-	if strings.Contains(string(out), ip) {
-		return nil // Already set, idempotent success
-	}
-	if out, err := exec.Command("ifconfig", nm.InterfaceName, "inet", ip+"/32", ip, "alias").CombinedOutput(); err != nil {
-		outStr := string(out)
-		// Handle case where address might already exist
-		if strings.Contains(strings.ToLower(outStr), "exists") ||
-			strings.Contains(strings.ToLower(outStr), "already") {
-			return nil
-		}
-		return fmt.Errorf("failed to set address: %s: %w", outStr, err)
-	}
-	nm.WireguardIP = ip
-	return nil
 }
 
 // SetPeer configures a WireGuard peer and adds a route for its allowed IPs.
@@ -295,13 +270,12 @@ func expandAbbreviatedNetstatCIDR(cidr string) string {
 
 // setMTU sets the MTU on the WireGuard interface.
 // Like wg-quick, it calculates MTU as (default interface MTU - 80) to account for WireGuard overhead.
-func (nm *DarwinNetworkManager) setMTU() error {
+func setMTU(interfaceName string) error {
 	// Find the default route's interface
 	out, err := exec.Command("netstat", "-nr", "-f", "inet").Output()
 	if err != nil {
 		return fmt.Errorf("failed to get routing table: %w", err)
 	}
-
 	var defaultIface string
 	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
@@ -314,17 +288,13 @@ func (nm *DarwinNetworkManager) setMTU() error {
 			break
 		}
 	}
-
 	if defaultIface == "" {
 		return fmt.Errorf("could not find default interface")
 	}
-
-	// Get the MTU of the default interface
 	out, err = exec.Command("ifconfig", defaultIface).Output()
 	if err != nil {
 		return fmt.Errorf("failed to get default interface info: %w", err)
 	}
-
 	mtuRegex := regexp.MustCompile(`mtu\s+(\d+)`)
 	matches := mtuRegex.FindStringSubmatch(string(out))
 	mtu := 1500 // Default fallback
@@ -333,15 +303,10 @@ func (nm *DarwinNetworkManager) setMTU() error {
 			mtu = parsed
 		}
 	}
-
 	// Subtract 80 bytes for WireGuard overhead (same as wg-quick)
 	wgMTU := mtu - 80
-
-	// Set MTU on our interface
-	if out, err := exec.Command("ifconfig", nm.InterfaceName, "mtu", strconv.Itoa(wgMTU)).CombinedOutput(); err != nil {
+	if out, err := exec.Command("ifconfig", interfaceName, "mtu", strconv.Itoa(wgMTU)).CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to set MTU: %s: %w", string(out), err)
 	}
-
-	nm.log.Info("set MTU", "interface", nm.InterfaceName, "mtu", wgMTU, "basedOn", defaultIface, "originalMTU", mtu)
 	return nil
 }

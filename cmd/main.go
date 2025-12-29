@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"net"
 	"os"
 	"runtime"
 
@@ -16,6 +18,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
@@ -90,15 +93,49 @@ func main() {
 		setupLog.Error(err, "failed to derive public key")
 		os.Exit(1)
 	}
+	cfg := ctrl.GetConfigOrDie()
+	kube, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "failed to create kube client")
+		os.Exit(1)
+	}
+	_, ipNet, err := net.ParseCIDR(nodeIPCidr)
+	if err != nil {
+		setupLog.Error(err, "failed to parse node-ip-cidr", "nodeIPCidr", nodeIPCidr)
+		os.Exit(1)
+	}
+	wireguardIP := ""
+	node := &corev1.Node{}
+	if err := kube.Get(context.Background(), client.ObjectKey{Name: nodeName}, node); err == nil {
+		if ann := node.GetAnnotations(); ann != nil {
+			wireguardIP = ann[limguard.AnnotationKeyWireguardIPV4Address]
+			log.Info("found existing IP annotation", "ip", wireguardIP)
+		}
+	}
+	if wireguardIP == "" {
+		log.Info("no existing IP annotation found, allocating new IP")
+		wireguardIP, err = limguard.EnsureWireguardIPAllocation(
+			context.Background(),
+			kube,
+			nodeName,
+			ipNet,
+			leaseNamespace,
+			log.WithValues("component", "ip-allocation"),
+		)
+		if err != nil {
+			setupLog.Error(err, "failed to allocate wireguard IP")
+			os.Exit(1)
+		}
+		log.Info("allocated new WireGuard IP", "ip", wireguardIP)
+	}
 	// NewNetworkManager is defined per-platform in linux.go and darwin.go
-	nm, err := limguard.NewNetworkManager(interfaceName, privateKeyPath, listenPort, log)
+	nm, err := limguard.NewNetworkManager(interfaceName, privateKeyPath, listenPort, wireguardIP, log)
 	if err != nil {
 		setupLog.Error(err, "failed to initialize network manager")
 		os.Exit(1)
 	}
 	log.Info("network manager initialized", "interface", interfaceName, "publicKey", publicKey, "os", runtime.GOOS)
-
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                        scheme,
 		LeaderElectionReleaseOnCancel: false,
 		HealthProbeBindAddress:        probeAddr,
@@ -108,7 +145,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := limguard.SetupWithManager(mgr, nm, nodeName, publicKey, nodeIPCidr, leaseNamespace, log.WithValues("component", "limguard")); err != nil {
+	if err := limguard.SetupWithManager(mgr, nm, nodeName, publicKey, wireguardIP, log.WithValues("component", "limguard")); err != nil {
 		setupLog.Error(err, "unable to setup limguard controller")
 		os.Exit(1)
 	}

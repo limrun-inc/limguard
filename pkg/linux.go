@@ -17,6 +17,7 @@ import (
 type LinuxNetworkManager struct {
 	// InterfaceName is the WireGuard interface name (e.g., "wg0")
 	InterfaceName string
+	WireguardIP   string
 
 	peerIPList   map[string]*Peer
 	peerIPListMu *sync.RWMutex
@@ -27,61 +28,44 @@ type LinuxNetworkManager struct {
 // NewNetworkManager creates a new LinuxNetworkManager.
 // It creates the WireGuard interface, configures it with the private key and listen port,
 // and brings it up. This should be called once at startup.
-func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, log logging.Logger) (*LinuxNetworkManager, error) {
-	nm := &LinuxNetworkManager{
-		InterfaceName: interfaceName,
-		peerIPList:    make(map[string]*Peer),
-		peerIPListMu:  &sync.RWMutex{},
-		log:           log,
-	}
-
-	// Create interface if it doesn't exist
+func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wireguardIp string, log logging.Logger) (*LinuxNetworkManager, error) {
 	if _, err := exec.Command("ip", "link", "show", interfaceName).Output(); err != nil {
 		if out, err := exec.Command("ip", "link", "add", interfaceName, "type", "wireguard").CombinedOutput(); err != nil {
 			return nil, fmt.Errorf("failed to create interface: %s: %w", string(out), err)
 		}
 	}
-
-	// Configure with private key and listen port
+	expectedAddr := fmt.Sprintf("%s/32", wireguardIp)
+	out, err := exec.Command("ip", "addr", "add", expectedAddr, "dev", interfaceName).CombinedOutput()
+	if err != nil {
+		outStr := string(out)
+		if !strings.Contains(strings.ToLower(outStr), "exists") &&
+			!strings.Contains(strings.ToLower(outStr), "already assigned") {
+			return nil, fmt.Errorf("failed to add address: %s: %w", outStr, err)
+		}
+	}
 	if out, err := exec.Command("wg", "set", interfaceName,
 		"listen-port", fmt.Sprintf("%d", listenPort),
 		"private-key", privateKeyPath,
 	).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("failed to configure WireGuard: %s: %w", string(out), err)
 	}
-
-	// Bring interface up
 	if out, err := exec.Command("ip", "link", "set", interfaceName, "up").CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("failed to bring interface up: %s: %w", string(out), err)
 	}
-
+	nm := &LinuxNetworkManager{
+		InterfaceName: interfaceName,
+		WireguardIP:   wireguardIp,
+		peerIPList:    make(map[string]*Peer),
+		peerIPListMu:  &sync.RWMutex{},
+		log:           log,
+	}
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		for range ticker.C {
 			nm.syncAllowedIPs()
 		}
 	}()
-
 	return nm, nil
-}
-
-// SetAddress sets the IP address on the WireGuard interface.
-func (nm *LinuxNetworkManager) SetWireguardIP(ip string) error {
-	expectedAddr := fmt.Sprintf("%s/32", ip)
-
-	// Try to add the address - if it already exists, that's fine
-	out, err := exec.Command("ip", "addr", "add", expectedAddr, "dev", nm.InterfaceName).CombinedOutput()
-	if err != nil {
-		outStr := string(out)
-		// Handle both error formats for "address already exists"
-		if strings.Contains(strings.ToLower(outStr), "exists") ||
-			strings.Contains(strings.ToLower(outStr), "already assigned") {
-			return nil // Already set, idempotent success
-		}
-		return fmt.Errorf("failed to add address: %s: %w", outStr, err)
-	}
-
-	return nil
 }
 
 // SetPeer configures a WireGuard peer and adds a route for its allowed IPs.
