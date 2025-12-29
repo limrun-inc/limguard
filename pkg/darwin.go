@@ -125,8 +125,11 @@ func (nm *DarwinNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint
 	// Check if route already exists using "route -n get"
 	// If the route exists, the command succeeds and shows route info
 	// If not, it fails with "not in table" or similar error
-	if out, err := exec.Command("route", "-n", "get", wireguardIp).CombinedOutput(); err != nil ||
-		!strings.Contains(string(out), "interface: "+nm.InterfaceName) {
+	out, err := exec.Command("route", "-n", "get", wireguardIp).CombinedOutput()
+	// Keep this intentionally simple: look for "interface:" followed by whitespace and the interface name.
+	// (No anchors/multiline needed; `route -n get` output is small and stable.)
+	ifaceRe := regexp.MustCompile(`interface:\s*` + regexp.QuoteMeta(nm.InterfaceName) + `(\s|$)`)
+	if err != nil || !ifaceRe.Match(out) {
 		if out, err := exec.Command("route", "-n", "add", "-host", wireguardIp, "-interface", nm.InterfaceName).CombinedOutput(); err != nil {
 			outStr := string(out)
 			// Ignore "route already exists" errors (race condition)
@@ -135,6 +138,8 @@ func (nm *DarwinNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint
 			}
 		}
 		nm.log.Info("added route for peer", "peerIP", wireguardIp)
+	} else {
+		nm.log.Debug("route already exists for peer", "peerIP", wireguardIp, "output", string(out))
 	}
 
 	nm.peerIPListMu.Lock()
