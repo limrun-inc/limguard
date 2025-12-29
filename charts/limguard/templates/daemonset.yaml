@@ -17,6 +17,8 @@ spec:
         app.kubernetes.io/name: limguard
         app.kubernetes.io/part-of: limguard
     spec:
+      nodeSelector:
+        kubernetes.io/os: linux
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       serviceAccountName: limguard
