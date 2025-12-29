@@ -24,13 +24,16 @@ func EnsureWireguardIPAllocation(
 	ctx context.Context,
 	kube client.Client,
 	nodeName string,
-	nodeIPNet *net.IPNet,
+	nodeIPNet string,
 	leaseNamespace string,
 	log logging.Logger,
 ) (string, error) {
-	// Allocate by attempting to create leases until one succeeds.
-	ip := firstUsableIP(nodeIPNet)
-	for nodeIPNet.Contains(ip) {
+	_, ipNet, err := net.ParseCIDR(nodeIPNet)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse node ip cidr %s: %w", nodeIPNet, err)
+	}
+	ip := firstUsableIP(ipNet)
+	for ipNet.Contains(ip) {
 		ipStr := ip.String()
 		leaseName := ipToLeaseName(ipStr)
 		now := metav1.NewMicroTime(time.Now())
@@ -68,7 +71,7 @@ func EnsureWireguardIPAllocation(
 		return "", fmt.Errorf("failed to create lease for %s: %w", ipStr, err)
 	}
 
-	return "", fmt.Errorf("no available IPs in range %s", nodeIPNet.String())
+	return "", fmt.Errorf("no available IPs in range %s", nodeIPNet)
 }
 
 // firstUsableIP returns the first usable IP in the CIDR (skips network address).

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"net"
 	"os"
 	"runtime"
 
@@ -99,11 +98,6 @@ func main() {
 		setupLog.Error(err, "failed to create kube client")
 		os.Exit(1)
 	}
-	_, ipNet, err := net.ParseCIDR(nodeIPCidr)
-	if err != nil {
-		setupLog.Error(err, "failed to parse node-ip-cidr", "nodeIPCidr", nodeIPCidr)
-		os.Exit(1)
-	}
 	wireguardIP := ""
 	node := &corev1.Node{}
 	if err := kube.Get(context.Background(), client.ObjectKey{Name: nodeName}, node); err == nil {
@@ -118,7 +112,7 @@ func main() {
 			context.Background(),
 			kube,
 			nodeName,
-			ipNet,
+			nodeIPCidr,
 			leaseNamespace,
 			log.WithValues("component", "ip-allocation"),
 		)
