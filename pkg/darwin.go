@@ -42,7 +42,7 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, log
 	if _, err := exec.Command("ifconfig", interfaceName).Output(); err != nil {
 		// Interface doesn't exist, create it with wireguard-go
 		// wireguard-go creates utun interfaces on macOS
-		if out, err := exec.Command("wireguard-go", interfaceName).CombinedOutput(); err != nil {
+		if out, err := exec.Command("/opt/homebrew/bin/wireguard-go", interfaceName).CombinedOutput(); err != nil {
 			return nil, fmt.Errorf("failed to create interface with wireguard-go: %s: %w", string(out), err)
 		}
 		for i := 0; i < 20; i++ { // Max 10 seconds
@@ -56,7 +56,7 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, log
 			return nil, fmt.Errorf("interface %s not available after wireguard-go started: %w", interfaceName, err)
 		}
 	}
-	if out, err := exec.Command("wg", "set", interfaceName,
+	if out, err := exec.Command("/opt/homebrew/bin/wg", "set", interfaceName,
 		"listen-port", fmt.Sprintf("%d", listenPort),
 		"private-key", privateKeyPath,
 	).CombinedOutput(); err != nil {
@@ -110,9 +110,9 @@ func (nm *DarwinNetworkManager) SetWireguardIP(ip string) error {
 
 // SetPeer configures a WireGuard peer and adds a route for its allowed IPs.
 func (nm *DarwinNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wireguardIp string) error {
-	if out, err := exec.CommandContext(ctx, "wg", "show", nm.InterfaceName, "peers").CombinedOutput(); err == nil && !strings.Contains(string(out), publicKey) {
+	if out, err := exec.CommandContext(ctx, "/opt/homebrew/bin/wg", "show", nm.InterfaceName, "peers").CombinedOutput(); err == nil && !strings.Contains(string(out), publicKey) {
 		// The first time we add this peer, so we configure only its own peer IP.
-		if out, err := exec.Command("wg", "set", nm.InterfaceName,
+		if out, err := exec.Command("/opt/homebrew/bin/wg", "set", nm.InterfaceName,
 			"peer", publicKey,
 			"endpoint", endpoint,
 			"allowed-ips", wireguardIp+"/32",
@@ -241,7 +241,7 @@ func (nm *DarwinNetworkManager) syncAllowedIPs() {
 				i++
 			}
 			allowedIpsStr := strings.Join(allowedIpCidrs, ",")
-			out, err := exec.CommandContext(ctx, "wg", "set", nm.InterfaceName,
+			out, err := exec.CommandContext(ctx, "/opt/homebrew/bin/wg", "set", nm.InterfaceName,
 				"peer", peer.PublicKey,
 				"endpoint", peer.Endpoint,
 				"allowed-ips", allowedIpsStr,
