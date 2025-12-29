@@ -13,8 +13,9 @@ You can run `limguard` on both Linux and macOS. PRs are welcome for Windows supp
 Calico, Cilium and others do provide built-in Wireguard capabilities and you should use them if they
 suit your needs for better integration.
 
-We run iOS simulators on macOS in 3 regions across the worls with our `virtual-kubelet` implementation
-where the macOS nodes are real Kubernetes nodes and participate in BGP of Calico for routing.
+At [lim.run](https://lim.run), we run iOS simulators on macOS in 3 regions across the world with
+our `virtual-kubelet` implementation where the macOS nodes are real Kubernetes nodes and participate
+in BGP of Calico for routing.
 This works fine when all nodes are in the same LAN, which is the case for regions where we own the
 racks, but not the regions where we rent the nodes that have public IPs. And sometimes it's a mix of
 on-premise and cloud nodes.
