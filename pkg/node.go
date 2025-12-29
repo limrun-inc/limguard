@@ -239,8 +239,14 @@ func inc(ip net.IP) {
 	}
 }
 
-// getNodeEndpoint returns the InternalIP of the node
+// getNodeEndpoint returns the underlay (non-WireGuard) IP address of the node to be used as the WireGuard endpoint.
+// If the node already has the endpoint annotation set, we prefer that (so operators can override it).
 func (r *Reconciler) getNodeEndpoint(node *corev1.Node) string {
+	if ann := node.GetAnnotations(); ann != nil {
+		if ep := strings.TrimSpace(ann[AnnotationKeyWireguardPublicEndpoint]); ep != "" {
+			return ep
+		}
+	}
 	for _, addr := range node.Status.Addresses {
 		if addr.Type == corev1.NodeInternalIP {
 			return addr.Address
