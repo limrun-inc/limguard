@@ -37,7 +37,7 @@ spec:
           args:
             - "--debug={{ .Values.debug | default false }}"
             - "--node-ip-cidr={{ .Values.nodeCIDR | default "10.200.0.0/24" }}"
-            - "--lease-namespace={{ .Values.leaseNamespace }}"
+            - "--configmap-namespace={{ .Release.Namespace }}"
           env:
             - name: NODE_NAME
               valueFrom:

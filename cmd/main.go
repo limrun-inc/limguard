@@ -11,7 +11,6 @@ import (
 	limguard "github.com/limrun-inc/limguard/pkg"
 	"github.com/limrun-inc/limguard/version"
 	"go.uber.org/zap/zapcore"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -29,14 +28,13 @@ var (
 
 func init() {
 	utilruntime.Must(corev1.AddToScheme(scheme))
-	utilruntime.Must(coordinationv1.AddToScheme(scheme))
 }
 
 func main() {
 	var debug bool
 	var nodeName string
 	var nodeIPCidr string
-	var leaseNamespace string
+	var configMapNamespace string
 	var probeAddr string
 	var interfaceName string
 	var listenPort int
@@ -48,7 +46,7 @@ func main() {
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging.")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "The name of the node this instance is running on.")
 	flag.StringVar(&nodeIPCidr, "node-ip-cidr", getEnvOrDefault("NODE_IP_CIDR", "10.200.0.0/24"), "The CIDR range to allocate WireGuard IPs from.")
-	flag.StringVar(&leaseNamespace, "lease-namespace", getEnvOrDefault("LEASE_NAMESPACE", "kube-node-lease"), "The namespace to create Lease objects for IP coordination.")
+	flag.StringVar(&configMapNamespace, "configmap-namespace", getEnvOrDefault("CONFIGMAP_NAMESPACE", "kube-system"), "The namespace for the IP allocation ConfigMap.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&interfaceName, "interface-name", getEnvOrDefault("INTERFACE_NAME", defaultInterfaceName), "The WireGuard interface name.")
 	flag.IntVar(&listenPort, "listen-port", 51820, "The WireGuard listen port.")
@@ -77,7 +75,7 @@ func main() {
 		"version", version.Version,
 		"nodeName", nodeName,
 		"nodeIPCidr", nodeIPCidr,
-		"leaseNamespace", leaseNamespace,
+		"configMapNamespace", configMapNamespace,
 		"interfaceName", interfaceName,
 		"listenPort", listenPort,
 	)
@@ -113,7 +111,7 @@ func main() {
 			kube,
 			nodeName,
 			nodeIPCidr,
-			leaseNamespace,
+			configMapNamespace,
 			log.WithValues("component", "ip-allocation"),
 		)
 		if err != nil {

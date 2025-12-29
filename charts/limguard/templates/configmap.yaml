@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: limguard-ip-allocations
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: limguard
+    app.kubernetes.io/part-of: limguard
+{{- if .Values.ipOverrides }}
+data:
+{{- range .Values.ipOverrides }}
+  {{ .ip | quote }}: {{ .node | quote }}
+{{- end }}
+{{- end }}

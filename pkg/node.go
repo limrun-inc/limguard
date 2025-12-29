@@ -28,10 +28,6 @@ const (
 
 	// DefaultListenPort is the WireGuard listen port
 	DefaultListenPort = 51820
-
-	// leaseRenewThreshold is how old the lease must be before we renew it.
-	// This prevents excessive lease updates that trigger reconciliation storms.
-	leaseRenewThreshold = 30 * time.Minute
 )
 
 type Peer struct {

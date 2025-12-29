@@ -7,7 +7,7 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "update", "patch"]
-  # Leases: CRUD for IP address coordination
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
+  # ConfigMaps: CRUD for IP address coordination
+  - apiGroups: [""]
+    resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
