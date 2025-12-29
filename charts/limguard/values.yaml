@@ -1,4 +1,5 @@
 nodeCIDR: 10.200.0.0/24
+leaseNamespace: kube-node-lease
 debug: false
 
 image:

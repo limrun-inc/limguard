@@ -93,11 +93,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// If the event is for another node, just configure that peer
 	if req.Name != r.nodeName {
-		return r.reconcilePeer(ctx, log, req.Name)
+		return r.reconcilePeer(ctx, log.WithValues("reconcile", "peer"), req.Name)
 	}
 
 	// Event is for our own node - do full setup
-	return r.reconcileSelf(ctx, log)
+	return r.reconcileSelf(ctx, log.WithValues("reconcile", "self"))
 }
 
 // reconcileSelf handles setup for our own node
