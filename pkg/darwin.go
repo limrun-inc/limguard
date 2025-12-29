@@ -201,7 +201,7 @@ func (nm *DarwinNetworkManager) syncAllowedIPs() {
 		gateway := fields[1]
 
 		// Skip if gateway is not an IP (e.g., "link#N" for direct routes)
-		if !isIPAddress(gateway) {
+		if !isIPAddress(gateway) || gateway == nm.WireguardIP {
 			continue
 		}
 
