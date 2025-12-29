@@ -40,7 +40,7 @@ func main() {
 	var listenPort int
 	defaultInterfaceName := "wg0"
 	if runtime.GOOS == "darwin" {
-		defaultInterfaceName = "utun0"
+		defaultInterfaceName = "utun5"
 	}
 
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging.")
