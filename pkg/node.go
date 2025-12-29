@@ -109,7 +109,8 @@ func (r *Reconciler) reconcileSelf(ctx context.Context, log logging.Logger) (ctr
 	}
 	ip, err := r.ensureIPAllocation(ctx, log, node)
 	if err != nil {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, fmt.Errorf("failed to allocate IP: %w", err)
+		log.Info("failed to allocate IP", "error", err)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	endpoint := r.getNodeEndpoint(node)
 	if endpoint == "" {
@@ -117,13 +118,16 @@ func (r *Reconciler) reconcileSelf(ctx context.Context, log logging.Logger) (ctr
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if err := r.updateNodeAnnotations(ctx, node, ip, r.publicKey, endpoint); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to update node annotations: %w", err)
+		log.Info("failed to update node annotations", "error", err)
+		return ctrl.Result{}, nil
 	}
 	if err := r.nm.SetWireguardIP(ip); err != nil {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, fmt.Errorf("failed to set interface address: %w", err)
+		log.Info("failed to set interface address", "error", err)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	if err := r.configureAllPeers(ctx, log); err != nil {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, fmt.Errorf("failed to configure peers: %w", err)
+		log.Info("failed to configure peers", "error", err)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	log.Debug("reconciliation complete", "ip", ip, "endpoint", endpoint)
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
