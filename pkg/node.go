@@ -92,6 +92,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			log.Info("failed to update node annotations", "error", err)
 			return ctrl.Result{}, nil
 		}
+		return ctrl.Result{}, nil
 	}
 	annotations := node.GetAnnotations()
 	if annotations == nil {

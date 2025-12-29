@@ -126,9 +126,7 @@ func (nm *LinuxNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint,
 	}
 
 	peerExists := false
-	allPublicKeys := make([]string, len(device.Peers))
-	for i, peer := range device.Peers {
-		allPublicKeys[i] = peer.PublicKey.String()
+	for _, peer := range device.Peers {
 		if peer.PublicKey.String() == pubKey.String() {
 			peerExists = true
 			break
@@ -136,11 +134,9 @@ func (nm *LinuxNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint,
 	}
 
 	if !peerExists {
-
 		nm.log.Info("peer does not exist, adding",
 			"publicKey", publicKey,
 			"endpoint", endpoint,
-			"allPublicKeys", strings.Join(allPublicKeys, ","),
 		)
 		// First time we add this peer so we configure only its own peer IP.
 		udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
