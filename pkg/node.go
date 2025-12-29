@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -163,14 +164,12 @@ func DerivePublicKey(privateKeyPath string) (string, error) {
 		return "", fmt.Errorf("failed to read private key: %w", err)
 	}
 
-	cmd := exec.Command("wg", "pubkey")
-	cmd.Stdin = strings.NewReader(strings.TrimSpace(string(data)))
-	out, err := cmd.Output()
+	privateKey, err := wgtypes.ParseKey(strings.TrimSpace(string(data)))
 	if err != nil {
-		return "", fmt.Errorf("failed to derive public key: %w", err)
+		return "", fmt.Errorf("failed to parse private key: %w", err)
 	}
 
-	return strings.TrimSpace(string(out)), nil
+	return privateKey.PublicKey().String(), nil
 }
 
 // EnsurePrivateKey reads or generates a WireGuard private key at the given path.
@@ -181,20 +180,20 @@ func EnsurePrivateKey(keyPath string) (string, error) {
 		return keyPath, nil
 	}
 
-	// Generate new key using wg command
-	out, err := exec.Command("wg", "genkey").Output()
+	// Generate new key using wgctrl
+	privateKey, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
 		return "", fmt.Errorf("failed to generate private key: %w", err)
 	}
 
 	// Ensure directory exists
-	dir := keyPath[:strings.LastIndex(keyPath, "/")]
+	dir := filepath.Dir(keyPath)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("failed to create directory: %w", err)
 	}
 
 	// Write key
-	if err := os.WriteFile(keyPath, []byte(strings.TrimSpace(string(out))), 0600); err != nil {
+	if err := os.WriteFile(keyPath, []byte(privateKey.String()), 0600); err != nil {
 		return "", fmt.Errorf("failed to write private key: %w", err)
 	}
 
