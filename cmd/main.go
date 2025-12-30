@@ -8,7 +8,7 @@ import (
 
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
 	"github.com/go-logr/logr"
-	limguard "github.com/limrun-inc/limguard/pkg"
+	"github.com/limrun-inc/limguard"
 	"github.com/limrun-inc/limguard/version"
 	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
