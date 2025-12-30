@@ -96,29 +96,17 @@ func main() {
 		setupLog.Error(err, "failed to create kube client")
 		os.Exit(1)
 	}
-	wireguardIP := ""
-	node := &corev1.Node{}
-	if err := kube.Get(context.Background(), client.ObjectKey{Name: nodeName}, node); err == nil {
-		if ann := node.GetAnnotations(); ann != nil {
-			wireguardIP = ann[limguard.AnnotationKeyWireguardIPV4Address]
-			log.Info("found existing IP annotation", "ip", wireguardIP)
-		}
-	}
-	if wireguardIP == "" {
-		log.Info("no existing IP annotation found, allocating new IP")
-		wireguardIP, err = limguard.EnsureWireguardIPAllocation(
-			context.Background(),
-			kube,
-			nodeName,
-			nodeIPCidr,
-			configMapNamespace,
-			log.WithValues("component", "ip-allocation"),
-		)
-		if err != nil {
-			setupLog.Error(err, "failed to allocate wireguard IP")
-			os.Exit(1)
-		}
-		log.Info("allocated new WireGuard IP", "ip", wireguardIP)
+	wireguardIP, err := limguard.EnsureWireguardIPAllocation(
+		context.Background(),
+		kube,
+		nodeName,
+		nodeIPCidr,
+		configMapNamespace,
+		log.WithValues("component", "ip-allocation"),
+	)
+	if err != nil {
+		setupLog.Error(err, "failed to allocate wireguard IP")
+		os.Exit(1)
 	}
 	// NewNetworkManager is defined per-platform in linux.go and darwin.go
 	nm, err := limguard.NewNetworkManager(interfaceName, privateKeyPath, listenPort, wireguardIP, log)
