@@ -77,10 +77,11 @@ func EnsureWireguardIPAllocation(
 	// We need to make sure that if there is an existing IP allocated for this node and not recorded in ConfigMap,
 	// it's backfilled. We cannot tolerate IP clash in the WireGuard network.
 	node := &corev1.Node{}
-	if err := kube.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
+	if err := kube.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil && !apierrors.IsNotFound(err) {
 		return "", fmt.Errorf("failed to get node %s: %w", nodeName, err)
 	}
-	if node.Annotations[AnnotationKeyWireguardIPV4Address] != "" {
+	// If node not found, annotations will be nil and we'll allocate a new IP.
+	if node.Annotations != nil && node.Annotations[AnnotationKeyWireguardIPV4Address] != "" {
 		log.Info("found existing IP annotation, migrating", "ip", node.Annotations[AnnotationKeyWireguardIPV4Address])
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			if err := kube.Get(ctx, cmKey, cm); err != nil {
