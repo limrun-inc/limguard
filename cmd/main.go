@@ -116,9 +116,9 @@ func main() {
 	}
 	log.Info("network manager initialized", "interface", interfaceName, "publicKey", publicKey, "os", runtime.GOOS)
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                        scheme,
-		LeaderElectionReleaseOnCancel: false,
-		HealthProbeBindAddress:        probeAddr,
+		Scheme:                 scheme,
+		HealthProbeBindAddress: probeAddr,
+		LeaderElection:         false,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to create manager")
