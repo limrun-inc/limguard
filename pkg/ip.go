@@ -86,6 +86,9 @@ func EnsureWireguardIPAllocation(
 			if err := kube.Get(ctx, cmKey, cm); err != nil {
 				return fmt.Errorf("failed to get IP allocation ConfigMap after creation conflict: %w", err)
 			}
+			if cm.Data == nil {
+				cm.Data = make(map[string]string)
+			}
 			cm.Data[node.Annotations[AnnotationKeyWireguardIPV4Address]] = nodeName
 			return kube.Update(ctx, cm)
 		}); err != nil {
