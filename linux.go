@@ -90,17 +90,6 @@ func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wir
 		wgClient.Close()
 		return nil, fmt.Errorf("failed to configure WireGuard: %w", err)
 	}
-	route := &netlink.Route{
-		LinkIndex: link.Attrs().Index,
-		Dst: &net.IPNet{
-			IP:   ip,
-			Mask: net.CIDRMask(32, 32),
-		},
-		Protocol: unix.RT_SCOPE_LINK,
-	}
-	if err := netlink.RouteReplace(route); err != nil {
-		return nil, fmt.Errorf("failed to add route: %w", err)
-	}
 	if err := netlink.LinkSetUp(link); err != nil {
 		wgClient.Close()
 		return nil, fmt.Errorf("failed to bring interface up: %w", err)
@@ -187,7 +176,7 @@ func (nm *LinuxNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint,
 			IP:   dstIP,
 			Mask: net.CIDRMask(32, 32),
 		},
-		Protocol: unix.RTPROT_STATIC,
+		Scope: unix.RT_SCOPE_LINK, // It must be LINK for BIRD to be able to add BGP routes.
 	}
 	if err := netlink.RouteReplace(route); err != nil {
 		return fmt.Errorf("failed to add route: %w", err)
