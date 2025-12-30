@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -50,9 +51,6 @@ func EnsureWireguardIPAllocation(
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      IPAllocationConfigMapName,
 				Namespace: configMapNamespace,
-				Labels: map[string]string{
-					LabelKeyLimguard: LabelValueTrue,
-				},
 			},
 			Data: make(map[string]string),
 		}
@@ -75,6 +73,26 @@ func EnsureWireguardIPAllocation(
 				return ip, nil
 			}
 		}
+	}
+	// We need to make sure that if there is an existing IP allocated for this node and not recorded in ConfigMap,
+	// it's backfilled. We cannot tolerate IP clash in the WireGuard network.
+	node := &corev1.Node{}
+	if err := kube.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
+		return "", fmt.Errorf("failed to get node %s: %w", nodeName, err)
+	}
+	if node.Annotations[AnnotationKeyWireguardIPV4Address] != "" {
+		log.Info("found existing IP annotation, migrating", "ip", node.Annotations[AnnotationKeyWireguardIPV4Address])
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			if err := kube.Get(ctx, cmKey, cm); err != nil {
+				return fmt.Errorf("failed to get IP allocation ConfigMap after creation conflict: %w", err)
+			}
+			cm.Data[node.Annotations[AnnotationKeyWireguardIPV4Address]] = nodeName
+			return kube.Update(ctx, cm)
+		}); err != nil {
+			return "", fmt.Errorf("failed to migrate IP allocation annotation: %w", err)
+		}
+		log.Info("migrated IP annotation", "ip", node.Annotations[AnnotationKeyWireguardIPV4Address])
+		return node.Annotations[AnnotationKeyWireguardIPV4Address], nil
 	}
 
 	// Try to allocate a new IP
