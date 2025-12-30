@@ -1,0 +1,13 @@
+installation:
+  cni:
+    type: Calico
+  calicoNetwork:
+    bgp: Enabled
+    nodeAddressAutodetectionV4:
+      interface: wg0
+    serviceCIDR: "10.96.0.0/12"
+    ipPools:
+      - name: default
+        cidr: 10.244.0.0/16
+        encapsulation: None
+kubeletVolumePluginPath: "/var/lib/k0s/kubelet"

@@ -1,0 +1,35 @@
+apiVersion: k0sctl.k0sproject.io/v1beta1
+kind: Cluster
+metadata:
+  name: eu-staging
+spec:
+  hosts:
+    - ssh:
+        address: 1.1.1.1
+        user: root
+        port: 22
+        keyPath: /tmp/ssh/id_rsa
+      role: controller+worker
+      noTaints: true
+    - ssh:
+        address: 2.2.2.2
+        user: root
+        port: 22
+        keyPath: /tmp/ssh/id_rsa
+      role: controller+worker
+      noTaints: true
+  k0s:
+    version: "v1.34.2+k0s.0"
+    versionChannel: stable
+    dynamicConfig: false
+    config:
+      spec:
+        storage:
+          type: etcd
+        network:
+          nodeLocalLoadBalancing:
+            enabled: true
+            type: EnvoyProxy
+          provider: custom
+          podCIDR: 10.244.0.0/16
+          serviceCIDR: 10.96.0.0/12
