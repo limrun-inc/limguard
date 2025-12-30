@@ -154,45 +154,25 @@ func (r *Reconciler) updateNodeAnnotations(ctx context.Context, node *corev1.Nod
 	return nil
 }
 
-// DerivePublicKey derives the public key from a private key file.
-func DerivePublicKey(privateKeyPath string) (string, error) {
-	data, err := os.ReadFile(privateKeyPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to read private key: %w", err)
-	}
-
-	privateKey, err := wgtypes.ParseKey(strings.TrimSpace(string(data)))
-	if err != nil {
-		return "", fmt.Errorf("failed to parse private key: %w", err)
-	}
-
-	return privateKey.PublicKey().String(), nil
-}
-
 // EnsurePrivateKey reads or generates a WireGuard private key at the given path.
-// Returns the path to the key file.
-func EnsurePrivateKey(keyPath string) (string, error) {
+func EnsurePrivateKey(keyPath string) (wgtypes.Key, error) {
 	// Try to read existing key
 	if _, err := os.Stat(keyPath); err == nil {
-		return keyPath, nil
+		k, err := os.ReadFile(keyPath)
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to read private key at %s: %w", keyPath, err)
+		}
+		return wgtypes.ParseKey(strings.TrimSpace(string(k)))
 	}
-
-	// Generate new key using wgctrl
 	privateKey, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
-		return "", fmt.Errorf("failed to generate private key: %w", err)
+		return wgtypes.Key{}, fmt.Errorf("failed to generate private key: %w", err)
 	}
-
-	// Ensure directory exists
-	dir := filepath.Dir(keyPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", fmt.Errorf("failed to create directory: %w", err)
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0700); err != nil {
+		return wgtypes.Key{}, fmt.Errorf("failed to create directory: %w", err)
 	}
-
-	// Write key
 	if err := os.WriteFile(keyPath, []byte(privateKey.String()), 0600); err != nil {
-		return "", fmt.Errorf("failed to write private key: %w", err)
+		return wgtypes.Key{}, fmt.Errorf("failed to write private key: %w", err)
 	}
-
-	return keyPath, nil
+	return privateKey, nil
 }

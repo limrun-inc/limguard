@@ -81,13 +81,9 @@ func main() {
 	)
 	ctrl.SetLogger(zlog)
 	privateKeyPath := "/etc/limguard/privatekey"
-	if _, err := limguard.EnsurePrivateKey(privateKeyPath); err != nil {
-		setupLog.Error(err, "failed to ensure private key")
-		os.Exit(1)
-	}
-	publicKey, err := limguard.DerivePublicKey(privateKeyPath)
+	privKey, err := limguard.EnsurePrivateKey(privateKeyPath)
 	if err != nil {
-		setupLog.Error(err, "failed to derive public key")
+		setupLog.Error(err, "failed to ensure private key")
 		os.Exit(1)
 	}
 	cfg := ctrl.GetConfigOrDie()
@@ -114,7 +110,7 @@ func main() {
 		setupLog.Error(err, "failed to initialize network manager")
 		os.Exit(1)
 	}
-	log.Info("network manager initialized", "interface", interfaceName, "publicKey", publicKey, "os", runtime.GOOS)
+	log.Info("network manager initialized", "interface", interfaceName, "publicKey", privKey.PublicKey().String(), "os", runtime.GOOS)
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                 scheme,
 		HealthProbeBindAddress: probeAddr,
@@ -125,7 +121,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := limguard.SetupWithManager(mgr, nm, nodeName, publicKey, wireguardIP, log.WithValues("component", "limguard")); err != nil {
+	if err := limguard.SetupWithManager(mgr, nm, nodeName, privKey.PublicKey().String(), wireguardIP, log.WithValues("component", "limguard")); err != nil {
 		setupLog.Error(err, "unable to setup limguard controller")
 		os.Exit(1)
 	}
