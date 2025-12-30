@@ -4,7 +4,7 @@ on:
     branches:
       - main
     tags:
-      - '*'
+      - 'v*'
 env:
   GO_VERSION: 1.25.0
 
@@ -27,7 +27,7 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF#refs/tags/}"
           else
-            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
             VERSION="${LAST_TAG}-${GITHUB_SHA::7}"
           fi
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
@@ -108,22 +108,26 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF#refs/tags/}"
           else
-            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
             VERSION="${LAST_TAG}-${GITHUB_SHA::7}"
           fi
+          # Strip 'v' prefix for Helm chart version (semver doesn't allow 'v' prefix)
+          CHART_VERSION="${VERSION#v}"
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "CHART_VERSION=${CHART_VERSION}" >> $GITHUB_OUTPUT
           echo "VERSION=${VERSION}"
+          echo "CHART_VERSION=${CHART_VERSION}"
       - name: Install yq
         uses: dcarbone/install-yq-action@4075b4dca348d74bd83f2bf82d30f25d7c54539b
       - name: Push the chart
         id: push
         env:
           VERSION: ${{ steps.version.outputs.VERSION }}
+          CHART_VERSION: ${{ steps.version.outputs.CHART_VERSION }}
         run: |
-          echo "Using version: ${VERSION}"
+          echo "Using image tag: ${VERSION}"
+          echo "Using chart version: ${CHART_VERSION}"
           yq -i ".image.tag = \"${VERSION}\"" charts/limguard/values.yaml
-          CHART_VERSION="${VERSION}"
-          echo "CHART_VERSION=${CHART_VERSION}"
           helm dependency update charts/limguard
           helm package charts/limguard --dependency-update --version=${CHART_VERSION} --app-version=${CHART_VERSION}
           OUT=$(set +e; helm push limguard-${CHART_VERSION}.tgz oci://ghcr.io/limrun-inc/charts 2>&1)
