@@ -43,7 +43,6 @@ All nodes must have the UDP port `51820` reachable from each other.
 ```bash
 helm upgrade --install limguard \
   oci://ghcr.io/limrun-inc/charts/limguard \
-  --version 0.7.0 \
   --namespace kube-system \
   --create-namespace \
   --set nodeCIDR: 10.200.0.0/24
