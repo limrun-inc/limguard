@@ -93,6 +93,10 @@ installation:
 * Tests with CNI modes other than BGP like IP-in-IP.
 * Testing with eBPF.
 
+### Operations
+
+See [OPERATIONS.md](./OPERATIONS.md) for operational knowledge and feel free to open PR to add cases.
+
 ### License
 
 `limguard` is MIT-licensed.
