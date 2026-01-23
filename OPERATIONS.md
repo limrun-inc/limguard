@@ -45,7 +45,7 @@ In a working host, run the following script that will produce a set of commands 
 your peer so that it knows about all other peers.
 
 ```bash
-./generate-bootstrap-from-wg.sh  --target-ip <public ip> --target-wg-ip <wireguard ip>
+./scripts/generate-bootstrap-from-wg.sh  --target-ip <public ip> --target-wg-ip <wireguard ip>
 ```
 
 Now you can install your Kubernetes distribution and it'll come up and connect to its known control-plane IPs.
