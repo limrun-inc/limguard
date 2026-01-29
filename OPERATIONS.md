@@ -39,9 +39,11 @@ In your laptop.
 kubectl annotate <nodename> limguard.limrun.com/public-key=${PUB_KEY} --overwrite
 ```
 
-#### Bootstrapping peers
+### Bootstrapping peers
 
-In a working host, run the following script that will produce a set of commands to run on
+#### Automated
+
+In a working Kubernetes API, run the following script that will produce a set of commands to run on
 your peer so that it knows about all other peers.
 
 ```bash
@@ -49,3 +51,40 @@ your peer so that it knows about all other peers.
 ```
 
 Now you can install your Kubernetes distribution and it'll come up and connect to its known control-plane IPs.
+
+#### Manual
+
+First, you need to create and bring up `wg0` interface in all hosts.
+
+```bash
+export PUBLIC_IP=
+export WG_IP=
+```
+```bash
+ip link add wg0 type wireguard
+
+# Create private key
+mkdir -p /etc/limguard
+wg genkey > /etc/limguard/privatekey
+chmod 600 /etc/limguard/privatekey
+ip addr add $WG_IP/32 dev wg0
+wg set wg0 private-key /etc/limguard/privatekey listen-port 51820
+ip link set wg0 up
+```
+
+Now you need to add all other peers in every host.
+In host 1:
+```bash
+# Get public key via "wg show wg0"
+export PEER2_PUBLIC_KEY=
+export PEER2_PUBLIC_IP=
+export PEER2_WG_IP=
+```
+```bash
+wg set wg0 peer "$PEER2_PUBLIC_KEY" endpoint "$PEER2_PUBLIC_IP:51820" allowed-ips "${PEER2_WG_IP}/32" persistent-keepalive 25
+ip route add $PEER2_WG_IP/32 dev wg0
+```
+
+Every peer should be added in other peer to enable direct connections. Once done, members will be able to talk to each other.
+
+When `limguard` comes up, it'll continue from the same setup.
