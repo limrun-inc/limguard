@@ -36,12 +36,17 @@ func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP
 		if out, err := exec.Command("/opt/homebrew/bin/wireguard-go", iface).CombinedOutput(); err != nil {
 			return nil, fmt.Errorf("create interface: %s: %w", out, err)
 		}
-		// Wait for interface
+		// Wait for interface to become available
+		available := false
 		for i := 0; i < 20; i++ {
 			if _, err := exec.Command("ifconfig", iface).Output(); err == nil {
+				available = true
 				break
 			}
 			time.Sleep(500 * time.Millisecond)
+		}
+		if !available {
+			return nil, fmt.Errorf("interface %s not available after wireguard-go started", iface)
 		}
 	}
 
@@ -137,7 +142,7 @@ func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wire
 		}); err != nil {
 			return fmt.Errorf("add peer: %w", err)
 		}
-		nm.log.Info("added peer", "publicKey", publicKey[:8]+"...", "endpoint", endpoint)
+		nm.log.Info("added peer", "publicKey", truncateKey(publicKey), "endpoint", endpoint)
 	}
 
 	// Add route if needed
@@ -176,8 +181,16 @@ func (nm *NetworkManager) RemovePeer(ctx context.Context, publicKey string) erro
 	}
 	nm.mu.Unlock()
 
-	nm.log.Info("removed peer", "publicKey", publicKey[:8]+"...")
+	nm.log.Info("removed peer", "publicKey", truncateKey(publicKey))
 	return nil
+}
+
+// truncateKey returns a truncated version of a public key for logging.
+func truncateKey(key string) string {
+	if len(key) > 8 {
+		return key[:8] + "..."
+	}
+	return key
 }
 
 // CurrentPeers returns the current peer public keys.

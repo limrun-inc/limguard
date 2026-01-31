@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -95,8 +96,11 @@ func cmdRun(args []string) {
 		os.Exit(1)
 	}
 
+	// Mutex to protect cfg during reload
+	var cfgMu sync.Mutex
+
 	// Initial peer sync
-	appliedPeers := reconcilePeers(context.Background(), nm, cfg, name, log)
+	reconcilePeers(context.Background(), nm, cfg, name, log)
 
 	// Health server
 	go func() {
@@ -106,12 +110,45 @@ func cmdRun(args []string) {
 	}()
 
 	// Watch config
-	watcher, _ := fsnotify.NewWatcher()
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Error("create file watcher", "error", err)
+		os.Exit(1)
+	}
 	defer watcher.Close()
-	watcher.Add(*cfgPath)
+
+	if err := watcher.Add(*cfgPath); err != nil {
+		log.Error("watch config file", "error", err)
+		os.Exit(1)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Channel to signal reload (avoids timer race)
+	reloadCh := make(chan struct{}, 1)
+
+	// Reload goroutine
+	go func() {
+		for range reloadCh {
+			cfgMu.Lock()
+			newCfg, err := config.Load(*cfgPath)
+			if err != nil {
+				log.Error("reload config", "error", err)
+				cfgMu.Unlock()
+				continue
+			}
+			if err := newCfg.Validate(); err != nil {
+				log.Error("invalid config", "error", err)
+				cfgMu.Unlock()
+				continue
+			}
+			cfg = newCfg
+			reconcilePeers(context.Background(), nm, cfg, name, log)
+			cfgMu.Unlock()
+			log.Info("config reloaded")
+		}
+	}()
 
 	var debounce *time.Timer
 	for {
@@ -119,26 +156,26 @@ func cmdRun(args []string) {
 		case <-sigCh:
 			log.Info("shutting down")
 			return
-		case ev := <-watcher.Events:
+		case ev, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
 			if ev.Op&(fsnotify.Write|fsnotify.Create) != 0 {
 				if debounce != nil {
 					debounce.Stop()
 				}
 				debounce = time.AfterFunc(500*time.Millisecond, func() {
-					newCfg, err := config.Load(*cfgPath)
-					if err != nil {
-						log.Error("reload config", "error", err)
-						return
+					select {
+					case reloadCh <- struct{}{}:
+					default: // reload already pending
 					}
-					if err := newCfg.Validate(); err != nil {
-						log.Error("invalid config", "error", err)
-						return
-					}
-					cfg = newCfg
-					appliedPeers = reconcilePeers(context.Background(), nm, cfg, name, log)
-					log.Info("config reloaded", "peers", len(appliedPeers))
 				})
 			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Error("watcher error", "error", err)
 		}
 	}
 }
@@ -278,8 +315,12 @@ func cmdDeploy(args []string) {
 		}
 
 		pubKey := strings.TrimSpace(out)
+		if pubKey == "" {
+			log.Error("bootstrap returned empty public key", "node", name)
+			os.Exit(1)
+		}
 		publicKeys[name] = pubKey
-		log.Info("bootstrapped", "node", name, "publicKey", pubKey[:8]+"...")
+		log.Info("bootstrapped", "node", name, "publicKey", truncateKey(pubKey))
 
 		client.Close()
 	}
@@ -437,15 +478,27 @@ func scpFile(client *ssh.Client, localPath, remotePath string, mode os.FileMode)
 
 func installLinuxService(client *ssh.Client, cfg *config.Config, nodeName string) {
 	service := fmt.Sprintf(`[Unit]
-Description=limguard
+Description=limguard WireGuard mesh network manager
 After=network-online.target
+Wants=network-online.target
 Before=kubelet.service
 
 [Service]
+Type=simple
 ExecStartPre=/sbin/modprobe wireguard || true
 ExecStart=%s run --config %s --node-name %s
 Restart=always
+RestartSec=5
+
+# Security
 AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=limguard
 
 [Install]
 WantedBy=multi-user.target
@@ -507,4 +560,12 @@ func newLoggerStderr(debug bool) *slog.Logger {
 		level = slog.LevelDebug
 	}
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+}
+
+// truncateKey returns a truncated version of a public key for logging.
+func truncateKey(key string) string {
+	if len(key) > 8 {
+		return key[:8] + "..."
+	}
+	return key
 }

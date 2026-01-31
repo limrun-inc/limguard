@@ -1,5 +1,83 @@
 # Operations
 
+## Manual Installation
+
+If not using `limguard deploy`:
+
+### Linux (systemd)
+
+```bash
+# Install binary
+sudo cp limguard /usr/local/bin/
+sudo chmod +x /usr/local/bin/limguard
+
+# Create config directory
+sudo mkdir -p /etc/limguard
+
+# Create systemd service
+sudo tee /etc/systemd/system/limguard.service << 'EOF'
+[Unit]
+Description=limguard WireGuard mesh network manager
+After=network-online.target
+Before=kubelet.service
+
+[Service]
+ExecStartPre=/sbin/modprobe wireguard || true
+ExecStart=/usr/local/bin/limguard run --config /etc/limguard/limguard.yaml --node-name %H
+Restart=always
+RestartSec=5
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable --now limguard
+```
+
+### macOS (launchd)
+
+```bash
+# Install wireguard-go
+brew install wireguard-go
+
+# Install binary
+sudo cp limguard /usr/local/bin/
+
+# Create config directory
+sudo mkdir -p /etc/limguard
+
+# Create launchd plist
+sudo tee /Library/LaunchDaemons/com.limrun.limguard.plist << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.limrun.limguard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/limguard</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>/etc/limguard/limguard.yaml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+# Load service
+sudo launchctl load /Library/LaunchDaemons/com.limrun.limguard.plist
+```
+
 ## Adding a Node
 
 1. Add the node to your `limguard.yaml`:

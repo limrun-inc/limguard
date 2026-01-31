@@ -91,23 +91,7 @@ limguard bootstrap --config /etc/limguard/limguard.yaml  # Bootstrap interface
 
 ## Manual Setup
 
-If not using `deploy`:
-
-1. Install binary to `/usr/local/bin/limguard`
-2. Create config at `/etc/limguard/limguard.yaml` with all nodes and public keys
-3. Start service:
-
-   Linux:
-   ```bash
-   cp packaging/systemd/limguard.service /etc/systemd/system/
-   systemctl enable --now limguard
-   ```
-
-   macOS:
-   ```bash
-   # Create launchd plist (see OPERATIONS.md)
-   launchctl load /Library/LaunchDaemons/com.limrun.limguard.plist
-   ```
+If not using `deploy`, see [OPERATIONS.md](./OPERATIONS.md) for manual installation steps.
 
 ## License
 

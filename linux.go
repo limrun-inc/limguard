@@ -130,7 +130,7 @@ func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wire
 		}); err != nil {
 			return fmt.Errorf("add peer: %w", err)
 		}
-		nm.log.Info("added peer", "publicKey", publicKey[:8]+"...", "endpoint", endpoint)
+		nm.log.Info("added peer", "publicKey", truncateKey(publicKey), "endpoint", endpoint)
 	}
 
 	// Add route
@@ -176,8 +176,16 @@ func (nm *NetworkManager) RemovePeer(ctx context.Context, publicKey string) erro
 	}
 	nm.mu.Unlock()
 
-	nm.log.Info("removed peer", "publicKey", publicKey[:8]+"...")
+	nm.log.Info("removed peer", "publicKey", truncateKey(publicKey))
 	return nil
+}
+
+// truncateKey returns a truncated version of a public key for logging.
+func truncateKey(key string) string {
+	if len(key) > 8 {
+		return key[:8] + "..."
+	}
+	return key
 }
 
 // CurrentPeers returns the current peer public keys.
