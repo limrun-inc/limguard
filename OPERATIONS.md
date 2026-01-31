@@ -1,90 +1,77 @@
-# Operations Guide
+# Operations
 
-### Bootstrapping issues after degradation
+## Adding a Node
 
-If a control-plane node went down and you had to re-install the OS, that means the private
-key is gone and limguard can't run on it because kubernetes scheduler is not running yet.
-And kubernetes can't run on it because it can't access other control-plane nodes.
+1. Add the node to your `limguard.yaml`:
+   ```yaml
+   nodes:
+     new-node:
+       wireguardIP: "10.200.0.10"
+       endpoint: "203.0.113.20"
+       ssh:
+         host: "203.0.113.20"
+         user: root
+   ```
 
-This shows how you can bootstrap the node to join the network and then limguard to take over.
+2. Run deploy:
+   ```bash
+   limguard deploy --config limguard.yaml
+   ```
 
-#### Losing the private key
+## Removing a Node
 
-First, you need to remove the peer from all the hosts. Get the public key from Node annotation.
+1. Remove from `limguard.yaml`
+2. Copy updated config to all remaining nodes
+3. Daemons will automatically remove the peer on reload
 
+## Key Rotation
+
+1. Stop daemon on the node
+2. Remove peer from all other nodes:
+   ```bash
+   wg set wg0 peer OLD_PUBLIC_KEY remove
+   ```
+3. Generate new key:
+   ```bash
+   rm /etc/limguard/privatekey
+   wg genkey > /etc/limguard/privatekey
+   chmod 600 /etc/limguard/privatekey
+   ```
+4. Update `publicKey` in config on all nodes
+5. Restart daemon
+
+## Troubleshooting
+
+Check status:
 ```bash
-export OLD_PUB_KEY=$(kubectl get node <nodename> -o jsonpath='{.metadata.annotations.limguard\.limrun\.com/public-key}')
+# Linux
+systemctl status limguard
+journalctl -u limguard -f
+
+# macOS
+tail -f /var/log/limguard.log
+
+# Both
+wg show
 ```
 
-Run the following in ALL hosts to remove the old peer.
-```bash
-wg set wg0 peer ${OLD_PUB_KEY} remove
-```
+Common issues:
+- **No handshake**: Check UDP 51820 is open, public keys match
+- **Interface missing**: Ensure wireguard module loaded (Linux) or wireguard-go installed (macOS)
+- **Config not reloading**: Check file permissions, restart daemon
 
-Create a new key in the host.
-```bash
-mkdir -p /etc/limguard
-
-# Generate new private key (if you don't have the old one)
-wg genkey > /etc/limguard/privatekey
-chmod 600 /etc/limguard/privatekey
-
-# Get the public key (you'll need to update the Node annotation if it changed)
-export PUB_KEY=$(wg pubkey < /etc/limguard/privatekey)
-```
-
-In your laptop.
+## Health Checks
 
 ```bash
-kubectl annotate <nodename> limguard.limrun.com/public-key=${PUB_KEY} --overwrite
+curl http://localhost:8081/healthz
+curl http://localhost:8081/readyz
 ```
 
-### Bootstrapping peers
+## Backup
 
-#### Automated
-
-In a working Kubernetes API, run the following script that will produce a set of commands to run on
-your peer so that it knows about all other peers.
-
+Only the private key needs backup:
 ```bash
-./scripts/generate-bootstrap-from-wg.sh  --target-ip <public ip> --target-wg-ip <wireguard ip>
+/etc/limguard/privatekey
 ```
 
-Now you can install your Kubernetes distribution and it'll come up and connect to its known control-plane IPs.
-
-#### Manual
-
-First, you need to create and bring up `wg0` interface in all hosts.
-
-```bash
-export PUBLIC_IP=
-export WG_IP=
-```
-```bash
-ip link add wg0 type wireguard
-
-# Create private key
-mkdir -p /etc/limguard
-wg genkey > /etc/limguard/privatekey
-chmod 600 /etc/limguard/privatekey
-ip addr add $WG_IP/32 dev wg0
-wg set wg0 private-key /etc/limguard/privatekey listen-port 51820
-ip link set wg0 up
-```
-
-Now you need to add all other peers in every host.
-In host 1:
-```bash
-# Get public key via "wg show wg0"
-export PEER2_PUBLIC_KEY=
-export PEER2_PUBLIC_IP=
-export PEER2_WG_IP=
-```
-```bash
-wg set wg0 peer "$PEER2_PUBLIC_KEY" endpoint "$PEER2_PUBLIC_IP:51820" allowed-ips "${PEER2_WG_IP}/32" persistent-keepalive 25
-ip route add $PEER2_WG_IP/32 dev wg0
-```
-
-Every peer should be added in other peer to enable direct connections. Once done, members will be able to talk to each other.
-
-When `limguard` comes up, it'll continue from the same setup.
+If lost, follow key rotation procedure.

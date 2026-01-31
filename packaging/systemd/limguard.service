@@ -1,0 +1,28 @@
+[Unit]
+Description=limguard WireGuard mesh network manager
+Documentation=https://github.com/limrun-inc/limguard
+After=network-online.target
+Wants=network-online.target
+# Start before kubelet so WireGuard fabric is ready for Kubernetes networking
+Before=kubelet.service
+
+[Service]
+Type=simple
+# Load wireguard kernel module if not built-in
+ExecStartPre=/sbin/modprobe wireguard || true
+ExecStart=/usr/local/bin/limguard run --config /etc/limguard/limguard.yaml --node-name %H
+Restart=always
+RestartSec=5
+
+# Security settings
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=limguard
+
+[Install]
+WantedBy=multi-user.target
