@@ -18,9 +18,10 @@ socket_vmnet provides shared networking for Lima VMs, enabling host ↔ VM and V
 # Install socket_vmnet
 brew install socket_vmnet
 
-# Create hardlink to expected location (Lima rejects symlinks)
+# Copy binary to expected location with root ownership (Lima requires root-owned binary)
 sudo mkdir -p /opt/socket_vmnet/bin
-sudo ln -f $(brew --prefix socket_vmnet)/bin/socket_vmnet /opt/socket_vmnet/bin/socket_vmnet
+sudo cp $(brew --prefix socket_vmnet)/bin/socket_vmnet /opt/socket_vmnet/bin/socket_vmnet
+sudo chown root:wheel /opt/socket_vmnet/bin/socket_vmnet
 
 # Configure sudoers for Lima networking
 limactl sudoers > etc_sudoers.d_lima
