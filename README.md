@@ -1,102 +1,144 @@
-# limguard - VPC over Wireguard for Kubernetes
+# limguard - WireGuard Mesh Network Manager
 
-`limguard` is a `DaemonSet` that runs on all Kubernetes nodes to set up wireguard peers and establish
-routes between them. You can run `limguard` to provide secure inter-node communication for public nodes
-and allow non-Linux peers to join the same network with Pod and Service reachability.
+`limguard` sets up WireGuard peers between nodes using a single YAML config file.
+It runs as a systemd/launchd service and can be deployed before Kubernetes.
 
-This project is used in production at [lim.run](https://lim.run) to have Linux & macOS nodes to share
-a network fabric regardless of their network placement in the world.
+## Quick Start
 
-You can run `limguard` on both Linux and macOS. PRs are welcome for Windows support.
-
-### Why not use support from CNI?
-
-Calico, Cilium and others do provide built-in Wireguard capabilities and you should use them if they
-suit your needs for better integration.
-
-At [lim.run](https://lim.run), we run iOS simulators on macOS in 3 regions across the world with
-our `virtual-kubelet` implementation where the macOS nodes are real Kubernetes nodes and participate
-in BGP of Calico for routing.
-This works fine when all nodes are in the same LAN, which is the case for regions where we own the
-racks, but not the regions where we rent the nodes that have public IPs. And sometimes it's a mix of
-on-premise and cloud nodes.
-
-To have secure communication between public nodes and still be able to do BGP routing, we needed a
-replacement for the physical network and Wireguard seemed like the best option. However, none of the
-CNIs would work well when there are external peers; either BGP breaks or CNI itself doesn't allow
-peering with external peers at all.
-
-So we built `limguard` to seperate the Wireguard layer from the CNI. When you run `limguard`, all
-Calico/Cilium/etc needs to know is that they need to use `wg0` interface and that's it; just as if
-you have all those nodes in the same LAN.
-
-## Get Started
-
-For a full cluster example, see [k0s + Calico + Limguard on Public Nodes](./examples/calico-bgp-wireguard)
-
-You can just deploy the Helm chart and the WireGuard network will be established automatically.
-You can postpone making your container network interface aware of the `wg0` interface they can
-use later on.
-
-All nodes must have the UDP port `51820` reachable from each other.
-
-```bash
-helm upgrade --install limguard \
-  oci://ghcr.io/limrun-inc/charts/limguard \
-  --namespace kube-system \
-  --create-namespace \
-  --set nodeCIDR: 10.200.0.0/24
-```
-
-You can see the IPs assigned to each node from `Node` annotations or the ConfigMap named
-`limguard-ip-allocations`.
-
-At this point, you only have the connectivity between the nodes but not between the pods. The BGP
-or any other pod CIDR distribution tech you use needs to add routes targeted for `wg0` which is
-the case for all kinds of networks.
-
-One thing different with WireGuard is that routing table doesn't suffice for it to match a packet
-with a peer, it needs those CIDRs explicitly set on the `wg0` interface as allowed IPs. `limguard`
-takes care of that sync by checking routes and adding them to `wg0` automatically.
-
-### Calico Setup with BGP
-
-Calico in BGP mode can use `wg0` as the target of the Pod IP addresses in nodes. Here is example
-installation YAMLs.
+### 1. Create config
 
 ```yaml
-# helm upgrade --install calico projectcalico/tigera-operator --version v3.31.3 --namespace tigera-operator --create-namespace -f calico-values.yaml
-installation:
-  cni:
-    type: Calico
-  calicoNetwork:
-    bgp: Enabled
-    nodeAddressAutodetectionV4:
-      interface: wg0
-    serviceCIDR: "10.96.0.0/12"
-    ipPools:
-      - name: default
-        cidr: 10.244.0.0/16
-        # You can enable encapsulation but it's not needed. "None" allows non-Calico peers to be
-        # able to participate.
-        encapsulation: None
+# limguard.yaml
+nodes:
+  node-1:
+    wireguardIP: "10.200.0.1"
+    endpoint: "203.0.113.10:51820"
+    ssh:
+      host: "203.0.113.10"
+      user: root
 
-# In case you're using k0s, you need to set this explicitly.
-# kubeletVolumePluginPath: "/var/lib/k0s/kubelet"
+  node-2:
+    wireguardIP: "10.200.0.2"
+    endpoint: "203.0.113.11:51820"
+    ssh:
+      host: "203.0.113.11"
+      user: root
 ```
 
-### Roadmap
+### 2. Deploy
 
-* We require peers to be `Node`s but they don't have to be. A `LimguardPeer` CRD would let your laptop
-  to join the cluster network just as any peer since we support both macOS and Linux.
-* Example with Cilium.
-* Tests with CNI modes other than BGP like IP-in-IP.
-* Testing with eBPF.
+```bash
+limguard apply --config limguard.yaml
+```
 
-### Operations
+This:
+1. Downloads the correct binary for each node from GitHub releases
+2. Installs binary on each node
+3. Generates WireGuard keys and brings up interface
+4. Collects public keys and updates your local YAML
+5. Distributes the complete config to all nodes
+6. Starts the daemon on all nodes
 
-See [OPERATIONS.md](./OPERATIONS.md) for operational knowledge and feel free to open PR to add cases.
+## Config Format
 
-### License
+One YAML file used everywhere:
 
-`limguard` is MIT-licensed.
+```yaml
+# Optional (defaults shown)
+linuxInterfaceName: wg0     # WireGuard interface on Linux
+darwinInterfaceName: utun9  # WireGuard interface on macOS
+
+# Version of limguard to download from GitHub releases.
+# If omitted, the latest release is fetched and written back to this file.
+# version: v1.0.0
+
+# All nodes
+nodes:
+  node-name:
+    wireguardIP: "10.200.0.1"   # WireGuard mesh IP
+    endpoint: "203.0.113.10:51820"  # Public IP/hostname with port
+    publicKey: "..."            # Filled in by apply
+    # localBinaryPath: /path/to/limguard  # Optional: use local binary instead of downloading
+    ssh:                        # Only needed for apply
+      host: "203.0.113.10"
+      port: 22
+      user: root
+
+  # Local node (join mesh from this machine)
+  ops-laptop:
+    wireguardIP: "10.200.0.50"
+    endpoint: "203.0.113.50:51821"
+    ssh:
+      host: self               # Special value: configure locally, no SSH
+```
+
+## Commands
+
+```bash
+limguard apply --config limguard.yaml   # Deploy to all nodes
+limguard run --config /etc/limguard/limguard.yaml  # Run daemon
+limguard version  # Print version
+```
+
+## Joining the Mesh Locally
+
+You can temporarily join the mesh from your local machine (e.g., for operations):
+
+```yaml
+nodes:
+  ops-laptop:
+    wireguardIP: "10.200.0.50"
+    endpoint: "your.public.ip:51821"
+    ssh:
+      host: self    # Special value: no SSH, configure locally
+```
+
+Run with root privileges:
+```bash
+sudo limguard apply --config limguard.yaml
+```
+
+To disconnect, remove the node from config and re-run `apply`. Other nodes will automatically remove it as a peer.
+
+## How It Works
+
+- Each node runs `limguard run` as a service
+- The daemon watches `/etc/limguard/limguard.yaml` for changes
+- When config changes, it reconciles peers (add/update/remove)
+- Routes through the WireGuard interface are synced to allowed IPs
+
+## Versioning
+
+By default, `limguard apply` downloads binaries from GitHub releases:
+
+- If `version` is not set in the config, the latest release is fetched
+- The resolved version is automatically written back to your config file
+- Subsequent runs will use the same version for reproducibility
+
+To upgrade, either:
+- Remove the `version` field to fetch the latest
+- Set `version: vX.Y.Z` to pin a specific release
+
+## Using Local Binaries
+
+For development or testing, you can use locally built binaries instead of downloading:
+
+```yaml
+nodes:
+  node-1:
+    wireguardIP: "10.200.0.1"
+    endpoint: "203.0.113.10:51820"
+    localBinaryPath: "/path/to/limguard-linux-arm64"
+    ssh:
+      host: "203.0.113.10"
+```
+
+When `localBinaryPath` is set for a node, that binary is used instead of downloading from GitHub releases. If all nodes have `localBinaryPath` set, version resolution and downloads are skipped entirely.
+
+## Manual Setup
+
+If not using `apply`, see [OPERATIONS.md](./OPERATIONS.md) for manual installation steps.
+
+## License
+
+MIT

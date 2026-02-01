@@ -5,6 +5,7 @@ package limguard
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -14,390 +15,339 @@ import (
 	"sync"
 	"time"
 
-	"github.com/crossplane/crossplane-runtime/pkg/logging"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// DarwinNetworkManager implements NetworkManager for macOS using ifconfig, route, and wgctrl.
-type DarwinNetworkManager struct {
-	InterfaceName string
-	WireguardIP   string
-
+// NetworkManager handles WireGuard interface and peer management on macOS.
+type NetworkManager struct {
+	iface    string
+	wgIP     string
 	wgClient *wgctrl.Client
-
-	peerIPList   map[string]*Peer
-	peerIPListMu *sync.RWMutex
-
-	log logging.Logger
+	peers    map[string]string // wireguardIP -> publicKey
+	mu       sync.RWMutex
+	log      *slog.Logger
+	done     chan struct{}
 }
 
-// NewNetworkManager creates a new DarwinNetworkManager.
-// It creates the WireGuard interface using wireguard-go, configures it with the private key and listen port,
-// and brings it up. This should be called once at startup.
-func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wireguardIp string, log logging.Logger) (*DarwinNetworkManager, error) {
-	if _, err := exec.Command("ifconfig", interfaceName).Output(); err != nil {
-		// Interface doesn't exist, create it with wireguard-go
-		// wireguard-go creates utun interfaces on macOS
-		if out, err := exec.Command("/opt/homebrew/bin/wireguard-go", interfaceName).CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("failed to create interface with wireguard-go: %s: %w", string(out), err)
+// NewNetworkManager creates the WireGuard interface and configures it.
+func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP string, log *slog.Logger) (*NetworkManager, error) {
+	// On macOS, interface name must be utun[0-9]+ (e.g., utun9)
+	if !strings.HasPrefix(iface, "utun") {
+		return nil, fmt.Errorf("macOS interface name must start with 'utun' (e.g., utun9), got: %s", iface)
+	}
+
+	// Create interface if needed
+	if _, err := exec.Command("ifconfig", iface).Output(); err != nil {
+		out, err := exec.Command("/opt/homebrew/bin/wireguard-go", iface).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("create interface: %s: %w", out, err)
 		}
-		for i := 0; i < 20; i++ { // Max 10 seconds
-			if _, err := exec.Command("ifconfig", interfaceName).Output(); err == nil {
+
+		// Wait for interface to become available
+		available := false
+		for i := 0; i < 20; i++ {
+			if _, err := exec.Command("ifconfig", iface).Output(); err == nil {
+				available = true
 				break
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
-		// Verify the interface is now available
-		if _, err := exec.Command("ifconfig", interfaceName).Output(); err != nil {
-			return nil, fmt.Errorf("interface %s not available after wireguard-go started: %w", interfaceName, err)
+		if !available {
+			return nil, fmt.Errorf("interface %s not available after wireguard-go started", iface)
 		}
+
 	}
-	if out, err := exec.Command("ifconfig", interfaceName, "inet", wireguardIp+"/32", wireguardIp, "alias").CombinedOutput(); err != nil {
-		outStr := string(out)
-		if !strings.Contains(strings.ToLower(outStr), "exists") &&
-			!strings.Contains(strings.ToLower(outStr), "already") {
-			return nil, fmt.Errorf("failed to set address: %s: %w", outStr, err)
+
+	// Add IP address
+	if out, err := exec.Command("ifconfig", iface, "inet", wireguardIP+"/32", wireguardIP, "alias").CombinedOutput(); err != nil {
+		outStr := strings.ToLower(string(out))
+		if !strings.Contains(outStr, "exists") && !strings.Contains(outStr, "already") {
+			return nil, fmt.Errorf("set address: %s: %w", out, err)
 		}
 	}
 
-	// Read private key from file
-	privateKeyBytes, err := os.ReadFile(privateKeyPath)
+	// Read private key
+	keyData, err := os.ReadFile(privateKeyPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read private key: %w", err)
+		return nil, fmt.Errorf("read private key: %w", err)
 	}
-	privateKey, err := wgtypes.ParseKey(strings.TrimSpace(string(privateKeyBytes)))
+	privateKey, err := wgtypes.ParseKey(strings.TrimSpace(string(keyData)))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key: %w", err)
+		return nil, fmt.Errorf("parse private key: %w", err)
 	}
 
-	// Create wgctrl client
 	wgClient, err := wgctrl.New()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create wgctrl client: %w", err)
+		return nil, fmt.Errorf("create wgctrl client: %w", err)
 	}
 
-	// Configure WireGuard interface
-	if err := wgClient.ConfigureDevice(interfaceName, wgtypes.Config{
+	if err := wgClient.ConfigureDevice(iface, wgtypes.Config{
 		PrivateKey: &privateKey,
 		ListenPort: &listenPort,
 	}); err != nil {
 		wgClient.Close()
-		return nil, fmt.Errorf("failed to configure WireGuard: %w", err)
+		return nil, fmt.Errorf("configure wireguard: %w", err)
 	}
 
-	// Set MTU like wg-quick: default interface MTU minus 80 bytes for WireGuard overhead
-	if err := setMTU(interfaceName); err != nil {
+	// Set MTU
+	if err := setMTU(iface); err != nil {
 		wgClient.Close()
-		return nil, fmt.Errorf("failed to set MTU: %w", err)
+		return nil, fmt.Errorf("set MTU: %w", err)
 	}
-	if out, err := exec.Command("ifconfig", interfaceName, "up").CombinedOutput(); err != nil {
+
+	if out, err := exec.Command("ifconfig", iface, "up").CombinedOutput(); err != nil {
 		wgClient.Close()
-		return nil, fmt.Errorf("failed to bring interface up: %s: %w", string(out), err)
+		return nil, fmt.Errorf("bring interface up: %s: %w", out, err)
 	}
-	nm := &DarwinNetworkManager{
-		InterfaceName: interfaceName,
-		wgClient:      wgClient,
-		peerIPList:    make(map[string]*Peer),
-		peerIPListMu:  &sync.RWMutex{},
-		WireguardIP:   wireguardIp,
-		log:           log,
+
+	nm := &NetworkManager{
+		iface:    iface,
+		wgIP:     wireguardIP,
+		wgClient: wgClient,
+		peers:    make(map[string]string),
+		log:      log,
+		done:     make(chan struct{}),
 	}
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		for range ticker.C {
-			nm.syncAllowedIPs()
-		}
-	}()
+
+	go nm.syncAllowedIPsLoop()
 	return nm, nil
 }
 
-// SetPeer configures a WireGuard peer and adds a route for its allowed IPs.
-func (nm *DarwinNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wireguardIp string) error {
+// Close stops the NetworkManager and releases resources.
+func (nm *NetworkManager) Close() error {
+	close(nm.done)
+	return nm.wgClient.Close()
+}
+
+// SetPeer adds or updates a WireGuard peer.
+func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wireguardIP string) error {
 	pubKey, err := wgtypes.ParseKey(publicKey)
 	if err != nil {
-		return fmt.Errorf("failed to parse public key: %w", err)
+		return fmt.Errorf("parse public key: %w", err)
 	}
 
-	// Check if peer already exists
-	device, err := nm.wgClient.Device(nm.InterfaceName)
+	device, err := nm.wgClient.Device(nm.iface)
 	if err != nil {
-		return fmt.Errorf("failed to get device: %w", err)
+		return fmt.Errorf("get device: %w", err)
 	}
 
-	peerExists := false
-	for _, peer := range device.Peers {
-		if peer.PublicKey.String() == pubKey.String() {
-			peerExists = true
+	exists := false
+	for _, p := range device.Peers {
+		if p.PublicKey.String() == publicKey {
+			exists = true
 			break
 		}
 	}
 
-	if !peerExists {
-		// The first time we add this peer, so we configure only its own peer IP.
+	if !exists {
 		udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
 		if err != nil {
-			return fmt.Errorf("failed to resolve endpoint: %w", err)
+			return fmt.Errorf("resolve endpoint: %w", err)
 		}
-
-		_, allowedIPNet, err := net.ParseCIDR(wireguardIp + "/32")
-		if err != nil {
-			return fmt.Errorf("failed to parse allowed IP: %w", err)
-		}
-
+		_, allowedIP, _ := net.ParseCIDR(wireguardIP + "/32")
 		keepalive := 25 * time.Second
-		if err := nm.wgClient.ConfigureDevice(nm.InterfaceName, wgtypes.Config{
-			Peers: []wgtypes.PeerConfig{
-				{
-					PublicKey:                   pubKey,
-					Endpoint:                    udpAddr,
-					AllowedIPs:                  []net.IPNet{*allowedIPNet},
-					PersistentKeepaliveInterval: &keepalive,
-				},
-			},
+
+		if err := nm.wgClient.ConfigureDevice(nm.iface, wgtypes.Config{
+			Peers: []wgtypes.PeerConfig{{
+				PublicKey:                   pubKey,
+				Endpoint:                    udpAddr,
+				AllowedIPs:                  []net.IPNet{*allowedIP},
+				PersistentKeepaliveInterval: &keepalive,
+			}},
 		}); err != nil {
-			return fmt.Errorf("failed to set peer: %w", err)
+			return fmt.Errorf("add peer: %w", err)
 		}
-		nm.log.Info("added peer for the first time", "publicKey", publicKey, "endpoint", endpoint)
+		nm.log.Info("added peer", "publicKey", publicKey, "endpoint", endpoint)
 	}
 
-	// Check if route already exists using "route -n get"
-	// If the route exists, the command succeeds and shows route info
-	// If not, it fails with "not in table" or similar error
-	out, err := exec.Command("route", "-n", "get", wireguardIp).CombinedOutput()
-	// Keep this intentionally simple: look for "interface:" followed by whitespace and the interface name.
-	// (No anchors/multiline needed; `route -n get` output is small and stable.)
-	ifaceRe := regexp.MustCompile(`interface:\s*` + regexp.QuoteMeta(nm.InterfaceName) + `(\s|$)`)
+	// Add route if needed
+	ifaceRe := regexp.MustCompile(`interface:\s*` + regexp.QuoteMeta(nm.iface) + `(\s|$)`)
+	out, err := exec.Command("route", "-n", "get", wireguardIP).CombinedOutput()
 	if err != nil || !ifaceRe.Match(out) {
-		if out, err := exec.Command("route", "-n", "add", "-host", wireguardIp, "-interface", nm.InterfaceName).CombinedOutput(); err != nil {
-			outStr := string(out)
-			// Ignore "route already exists" errors (race condition)
-			if !strings.Contains(strings.ToLower(outStr), "exists") {
-				return fmt.Errorf("failed to add route: %s: %w", outStr, err)
-			}
+		if routeOut, routeErr := exec.Command("route", "-n", "add", "-host", wireguardIP, "-interface", nm.iface).CombinedOutput(); routeErr != nil {
+			return fmt.Errorf("add route for %s: %s: %w", wireguardIP, routeOut, routeErr)
 		}
-		nm.log.Info("added route for peer", "peerIP", wireguardIp)
 	}
 
-	nm.peerIPListMu.Lock()
-	defer nm.peerIPListMu.Unlock()
-	if nm.peerIPList[wireguardIp] != nil {
-		nm.peerIPList[wireguardIp].PublicKey = publicKey
-		nm.peerIPList[wireguardIp].Endpoint = endpoint
-		return nil
-	}
-	nm.peerIPList[wireguardIp] = &Peer{
-		PublicKey:   publicKey,
-		Endpoint:    endpoint,
-		WireguardIP: wireguardIp,
-	}
+	nm.mu.Lock()
+	nm.peers[wireguardIP] = publicKey
+	nm.mu.Unlock()
 	return nil
 }
 
-// syncAllowedIPs lists routes, builds a map of CIDRs to peer IPs, and updates
-// the allowedIPs of WireGuard peers accordingly.
-func (nm *DarwinNetworkManager) syncAllowedIPs() {
-	// On macOS, use netstat -rn to get routing table
+// RemovePeer removes a WireGuard peer.
+func (nm *NetworkManager) RemovePeer(ctx context.Context, publicKey string) error {
+	pubKey, err := wgtypes.ParseKey(publicKey)
+	if err != nil {
+		return fmt.Errorf("parse public key: %w", err)
+	}
+
+	if err := nm.wgClient.ConfigureDevice(nm.iface, wgtypes.Config{
+		Peers: []wgtypes.PeerConfig{{PublicKey: pubKey, Remove: true}},
+	}); err != nil {
+		return fmt.Errorf("remove peer: %w", err)
+	}
+
+	nm.mu.Lock()
+	for ip, pk := range nm.peers {
+		if pk == publicKey {
+			if out, err := exec.Command("route", "-n", "delete", "-host", ip).CombinedOutput(); err != nil {
+				nm.mu.Unlock()
+				return fmt.Errorf("delete route for %s: %s: %w", ip, out, err)
+			}
+			delete(nm.peers, ip)
+			break
+		}
+	}
+	nm.mu.Unlock()
+
+	nm.log.Info("removed peer", "publicKey", publicKey)
+	return nil
+}
+
+// CurrentPeers returns the current peer public keys.
+func (nm *NetworkManager) CurrentPeers() map[string]string {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+	result := make(map[string]string)
+	for ip, pk := range nm.peers {
+		result[ip] = pk
+	}
+	return result
+}
+
+func (nm *NetworkManager) syncAllowedIPsLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-nm.done:
+			return
+		case <-ticker.C:
+			nm.syncAllowedIPs()
+		}
+	}
+}
+
+func (nm *NetworkManager) syncAllowedIPs() {
 	out, err := exec.Command("netstat", "-rn").Output()
 	if err != nil {
-		nm.log.Debug("failed to get routing table", "error", err)
 		return
 	}
 
-	// Parse netstat output to find routes through our interface
-	// Example netstat -rn output on macOS:
-	// Destination        Gateway            Flags        Netif Expire
-	// 10.244.23.0/26     10.200.0.18        UGSc         utun5
-	peerCIDRs := make(map[string]map[string]struct{})
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
+	// Map gateway -> CIDRs
+	peerCIDRs := make(map[string][]string)
+	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 4 {
 			continue
 		}
-
-		// Check if this route uses our interface
-		// The interface name is typically in the 4th or later column
-		interfaceIdx := -1
-		for i, field := range fields {
-			if field == nm.InterfaceName {
-				interfaceIdx = i
+		// Check if route uses our interface
+		hasIface := false
+		for _, f := range fields {
+			if f == nm.iface {
+				hasIface = true
 				break
 			}
 		}
-		if interfaceIdx == -1 {
+		if !hasIface {
 			continue
 		}
 
 		cidr := fields[0]
 		gateway := fields[1]
-
-		// Skip if gateway is not an IP (e.g., "link#N" for direct routes)
-		if !isIPAddress(gateway) || gateway == nm.WireguardIP {
+		if !isIPv4(gateway) || gateway == nm.wgIP {
 			continue
 		}
 
-		// netstat on macOS may abbreviate IPv4 CIDRs, e.g. "10.96.0.0/12" as "10.96/12".
-		// Expand those so wg receives a valid CIDR string.
-		cidr = expandAbbreviatedNetstatCIDR(cidr)
-
-		// Normalize CIDR - netstat might show just IP without /32
+		cidr = expandCIDR(cidr)
 		if !strings.Contains(cidr, "/") {
 			cidr = cidr + "/32"
 		}
+		peerCIDRs[gateway] = append(peerCIDRs[gateway], cidr)
+	}
 
-		if peerCIDRs[gateway] == nil {
-			peerCIDRs[gateway] = make(map[string]struct{})
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+
+	for peerIP, publicKey := range nm.peers {
+		cidrs, ok := peerCIDRs[peerIP]
+		if !ok {
+			continue
 		}
-		peerCIDRs[gateway][cidr] = struct{}{}
-	}
 
-	wg := &sync.WaitGroup{}
-	for peerIP := range peerCIDRs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			nm.peerIPListMu.Lock()
-			peer, ok := nm.peerIPList[peerIP]
-			if !ok {
-				nm.log.Info("peer ip detected in routes but not in internal peer map", "peerIP", peerIP)
-				nm.peerIPListMu.Unlock()
-				return
-			}
-			nm.peerIPListMu.Unlock()
+		pubKey, _ := wgtypes.ParseKey(publicKey)
+		allowedIPs := []net.IPNet{}
+		_, peerNet, _ := net.ParseCIDR(peerIP + "/32")
+		allowedIPs = append(allowedIPs, *peerNet)
 
-			pubKey, err := wgtypes.ParseKey(peer.PublicKey)
-			if err != nil {
-				nm.log.Info("failed to parse public key", "peerIP", peerIP, "err", err)
-				return
-			}
-
-			udpAddr, err := net.ResolveUDPAddr("udp", peer.Endpoint)
-			if err != nil {
-				nm.log.Info("failed to resolve endpoint", "peerIP", peerIP, "err", err)
-				return
-			}
-
-			// Build allowed IPs list
-			allowedIPs := make([]net.IPNet, 0, len(peerCIDRs[peerIP])+1)
-			_, peerIPNet, err := net.ParseCIDR(peer.WireguardIP + "/32")
-			if err != nil {
-				nm.log.Info("failed to parse peer wireguard IP", "peerIP", peerIP, "err", err)
-				return
-			}
-			allowedIPs = append(allowedIPs, *peerIPNet)
-
-			allowedIPStrs := []string{peer.WireguardIP + "/32"}
-			for cidr := range peerCIDRs[peerIP] {
-				_, ipNet, err := net.ParseCIDR(cidr)
-				if err != nil {
-					nm.log.Info("failed to parse CIDR", "cidr", cidr, "err", err)
-					continue
-				}
+		for _, cidr := range cidrs {
+			_, ipNet, err := net.ParseCIDR(cidr)
+			if err == nil {
 				allowedIPs = append(allowedIPs, *ipNet)
-				allowedIPStrs = append(allowedIPStrs, cidr)
 			}
+		}
 
-			if err := nm.wgClient.ConfigureDevice(nm.InterfaceName, wgtypes.Config{
-				Peers: []wgtypes.PeerConfig{
-					{
-						PublicKey:         pubKey,
-						UpdateOnly:        true,
-						Endpoint:          udpAddr,
-						ReplaceAllowedIPs: true,
-						AllowedIPs:        allowedIPs,
-					},
-				},
-			}); err != nil {
-				nm.log.Info("failed to update peer allowed IPs", "peerIP", peerIP, "err", err)
-				return
-			}
-			nm.log.Debug("updated peer allowed IPs", "peerIP", peerIP, "allowedIPs", strings.Join(allowedIPStrs, ","))
-		}()
+		if err := nm.wgClient.ConfigureDevice(nm.iface, wgtypes.Config{
+			Peers: []wgtypes.PeerConfig{{
+				PublicKey:         pubKey,
+				UpdateOnly:        true,
+				ReplaceAllowedIPs: true,
+				AllowedIPs:        allowedIPs,
+			}},
+		}); err != nil {
+			nm.log.Error("failed to sync allowed IPs", "peer", peerIP, "error", err)
+		}
 	}
-	wg.Wait()
 }
 
-// isIPAddress checks if a string looks like an IP address
-func isIPAddress(s string) bool {
-	// Simple check - starts with digit and contains dots
-	if len(s) == 0 {
-		return false
-	}
-	if s[0] < '0' || s[0] > '9' {
-		return false
-	}
-	return strings.Contains(s, ".")
+func isIPv4(s string) bool {
+	return len(s) > 0 && s[0] >= '0' && s[0] <= '9' && strings.Contains(s, ".")
 }
 
-// expandAbbreviatedNetstatCIDR expands macOS netstat abbreviated IPv4 CIDRs.
-// Example: "10.96/12" -> "10.96.0.0/12", "10/8" -> "10.0.0.0/8".
-// If the input doesn't look like an abbreviated IPv4 CIDR, it is returned unchanged.
-func expandAbbreviatedNetstatCIDR(cidr string) string {
+// expandCIDR expands abbreviated macOS netstat CIDRs like "10.96/12" -> "10.96.0.0/12"
+func expandCIDR(cidr string) string {
 	parts := strings.Split(cidr, "/")
-	if len(parts) != 2 {
+	if len(parts) != 2 || strings.Contains(parts[0], ":") {
 		return cidr
 	}
-	ipPart, maskPart := parts[0], parts[1]
-	// Only handle IPv4 here. IPv6 routes in netstat output are different.
-	if strings.Contains(ipPart, ":") {
-		return cidr
+	ip := parts[0]
+	for strings.Count(ip, ".") < 3 {
+		ip += ".0"
 	}
-	dots := strings.Count(ipPart, ".")
-	if dots >= 3 {
-		return cidr
-	}
-	// Append ".0" until it's a full dotted quad.
-	for dots < 3 {
-		ipPart += ".0"
-		dots++
-	}
-	return ipPart + "/" + maskPart
+	return ip + "/" + parts[1]
 }
 
-// setMTU sets the MTU on the WireGuard interface.
-// Like wg-quick, it calculates MTU as (default interface MTU - 80) to account for WireGuard overhead.
-func setMTU(interfaceName string) error {
-	// Find the default route's interface
+func setMTU(iface string) error {
 	out, err := exec.Command("netstat", "-nr", "-f", "inet").Output()
 	if err != nil {
-		return fmt.Errorf("failed to get routing table: %w", err)
+		return err
 	}
 	var defaultIface string
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
+	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 4 && fields[0] == "default" {
-			// On macOS netstat -nr -f inet output:
-			// Destination        Gateway            Flags               Netif Expire
-			// default            192.168.1.1        UGScg                 en0
 			defaultIface = fields[3]
 			break
 		}
 	}
 	if defaultIface == "" {
-		return fmt.Errorf("could not find default interface")
+		return fmt.Errorf("no default interface")
 	}
+
 	out, err = exec.Command("ifconfig", defaultIface).Output()
 	if err != nil {
-		return fmt.Errorf("failed to get default interface info: %w", err)
+		return err
 	}
-	mtuRegex := regexp.MustCompile(`mtu\s+(\d+)`)
-	matches := mtuRegex.FindStringSubmatch(string(out))
-	mtu := 1500 // Default fallback
-	if len(matches) >= 2 {
-		if parsed, err := strconv.Atoi(matches[1]); err == nil && parsed > 0 {
-			mtu = parsed
+
+	mtu := 1500
+	if matches := regexp.MustCompile(`mtu\s+(\d+)`).FindStringSubmatch(string(out)); len(matches) >= 2 {
+		if n, err := strconv.Atoi(matches[1]); err == nil && n > 0 {
+			mtu = n
 		}
 	}
-	// Subtract 80 bytes for WireGuard overhead (same as wg-quick)
-	wgMTU := mtu - 80
-	if out, err := exec.Command("ifconfig", interfaceName, "mtu", strconv.Itoa(wgMTU)).CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to set MTU: %s: %w", string(out), err)
-	}
-	return nil
+
+	_, err = exec.Command("ifconfig", iface, "mtu", strconv.Itoa(mtu-80)).CombinedOutput()
+	return err
 }

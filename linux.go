@@ -5,291 +5,264 @@ package limguard
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/crossplane/crossplane-runtime/pkg/logging"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// LinuxNetworkManager implements NetworkManager for Linux using netlink and wgctrl.
-type LinuxNetworkManager struct {
-	// InterfaceName is the WireGuard interface name (e.g., "wg0")
-	InterfaceName string
-	WireguardIP   string
-
+// NetworkManager handles WireGuard interface and peer management on Linux.
+type NetworkManager struct {
+	iface    string
+	wgIP     string
 	wgClient *wgctrl.Client
 	link     netlink.Link
-
-	peerIPList   map[string]*Peer
-	peerIPListMu *sync.RWMutex
-
-	log logging.Logger
+	peers    map[string]string // wireguardIP -> publicKey
+	mu       sync.RWMutex
+	log      *slog.Logger
+	done     chan struct{}
 }
 
-// NewNetworkManager creates a new LinuxNetworkManager.
-// It creates the WireGuard interface, configures it with the private key and listen port,
-// and brings it up. This should be called once at startup.
-func NewNetworkManager(interfaceName, privateKeyPath string, listenPort int, wireguardIp string, log logging.Logger) (*LinuxNetworkManager, error) {
-	// Check if interface exists, create if not
-	link, err := netlink.LinkByName(interfaceName)
+// NewNetworkManager creates the WireGuard interface and configures it.
+func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP string, log *slog.Logger) (*NetworkManager, error) {
+	link, err := netlink.LinkByName(iface)
 	if err != nil {
-		// Interface doesn't exist, create it
-		wgLink := &netlink.Wireguard{
-			LinkAttrs: netlink.LinkAttrs{
-				Name: interfaceName,
-			},
-		}
+		wgLink := &netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: iface}}
 		if err := netlink.LinkAdd(wgLink); err != nil {
-			return nil, fmt.Errorf("failed to create interface: %w", err)
+			return nil, fmt.Errorf("create interface: %w", err)
 		}
-		link, err = netlink.LinkByName(interfaceName)
+		link, err = netlink.LinkByName(iface)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get interface after creation: %w", err)
+			return nil, fmt.Errorf("get interface: %w", err)
 		}
 	}
 
-	// Add IP address to interface
-	ip := net.ParseIP(wireguardIp)
+	ip := net.ParseIP(wireguardIP)
 	if ip == nil {
-		return nil, fmt.Errorf("failed to parse wireguard IP: %s", wireguardIp)
+		return nil, fmt.Errorf("invalid wireguard IP: %s", wireguardIP)
 	}
-	addr := &netlink.Addr{
-		IPNet: &net.IPNet{
-			IP:   ip,
-			Mask: net.CIDRMask(32, 32),
-		},
+	addr := &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}}
+	if err := netlink.AddrAdd(link, addr); err != nil && !strings.Contains(err.Error(), "exists") {
+		return nil, fmt.Errorf("add address: %w", err)
 	}
-	if err := netlink.AddrAdd(link, addr); err != nil {
-		if !strings.Contains(err.Error(), "exists") {
-			return nil, fmt.Errorf("failed to add address: %w", err)
-		}
-	}
-	privateKeyBytes, err := os.ReadFile(privateKeyPath)
+
+	keyData, err := os.ReadFile(privateKeyPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read private key: %w", err)
+		return nil, fmt.Errorf("read private key: %w", err)
 	}
-	privateKey, err := wgtypes.ParseKey(strings.TrimSpace(string(privateKeyBytes)))
+	privateKey, err := wgtypes.ParseKey(strings.TrimSpace(string(keyData)))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key: %w", err)
+		return nil, fmt.Errorf("parse private key: %w", err)
 	}
+
 	wgClient, err := wgctrl.New()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create wgctrl client: %w", err)
+		return nil, fmt.Errorf("create wgctrl client: %w", err)
 	}
-	if err := wgClient.ConfigureDevice(interfaceName, wgtypes.Config{
+
+	if err := wgClient.ConfigureDevice(iface, wgtypes.Config{
 		PrivateKey: &privateKey,
 		ListenPort: &listenPort,
 	}); err != nil {
 		wgClient.Close()
-		return nil, fmt.Errorf("failed to configure WireGuard: %w", err)
+		return nil, fmt.Errorf("configure wireguard: %w", err)
 	}
+
 	if err := netlink.LinkSetUp(link); err != nil {
 		wgClient.Close()
-		return nil, fmt.Errorf("failed to bring interface up: %w", err)
+		return nil, fmt.Errorf("bring interface up: %w", err)
 	}
-	nm := &LinuxNetworkManager{
-		InterfaceName: interfaceName,
-		WireguardIP:   wireguardIp,
-		wgClient:      wgClient,
-		link:          link,
-		peerIPList:    make(map[string]*Peer),
-		peerIPListMu:  &sync.RWMutex{},
-		log:           log,
+
+	nm := &NetworkManager{
+		iface:    iface,
+		wgIP:     wireguardIP,
+		wgClient: wgClient,
+		link:     link,
+		peers:    make(map[string]string),
+		log:      log,
+		done:     make(chan struct{}),
 	}
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		for range ticker.C {
-			nm.syncAllowedIPs()
-		}
-	}()
+
+	go nm.syncAllowedIPsLoop()
 	return nm, nil
 }
 
-// SetPeer configures a WireGuard peer and adds a route for its allowed IPs.
-func (nm *LinuxNetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wireguardIp string) error {
+// Close stops the NetworkManager and releases resources.
+func (nm *NetworkManager) Close() error {
+	close(nm.done)
+	return nm.wgClient.Close()
+}
+
+// SetPeer adds or updates a WireGuard peer.
+func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wireguardIP string) error {
 	pubKey, err := wgtypes.ParseKey(publicKey)
 	if err != nil {
-		return fmt.Errorf("failed to parse public key: %w", err)
+		return fmt.Errorf("parse public key: %w", err)
 	}
 
-	// Check if peer already exists
-	device, err := nm.wgClient.Device(nm.InterfaceName)
+	device, err := nm.wgClient.Device(nm.iface)
 	if err != nil {
-		return fmt.Errorf("failed to get device: %w", err)
+		return fmt.Errorf("get device: %w", err)
 	}
 
-	peerExists := false
-	for _, peer := range device.Peers {
-		if peer.PublicKey.String() == pubKey.String() {
-			peerExists = true
+	exists := false
+	for _, p := range device.Peers {
+		if p.PublicKey.String() == publicKey {
+			exists = true
 			break
 		}
 	}
 
-	if !peerExists {
-		nm.log.Info("peer does not exist, adding",
-			"publicKey", publicKey,
-			"endpoint", endpoint,
-		)
-		// First time we add this peer so we configure only its own peer IP.
+	if !exists {
 		udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
 		if err != nil {
-			return fmt.Errorf("failed to resolve endpoint: %w", err)
+			return fmt.Errorf("resolve endpoint: %w", err)
 		}
-
-		_, allowedIPNet, err := net.ParseCIDR(wireguardIp + "/32")
-		if err != nil {
-			return fmt.Errorf("failed to parse allowed IP: %w", err)
-		}
-
+		_, allowedIP, _ := net.ParseCIDR(wireguardIP + "/32")
 		keepalive := 25 * time.Second
-		if err := nm.wgClient.ConfigureDevice(nm.InterfaceName, wgtypes.Config{
-			Peers: []wgtypes.PeerConfig{
-				{
-					PublicKey:                   pubKey,
-					Endpoint:                    udpAddr,
-					AllowedIPs:                  []net.IPNet{*allowedIPNet},
-					PersistentKeepaliveInterval: &keepalive,
-				},
-			},
+
+		if err := nm.wgClient.ConfigureDevice(nm.iface, wgtypes.Config{
+			Peers: []wgtypes.PeerConfig{{
+				PublicKey:                   pubKey,
+				Endpoint:                    udpAddr,
+				AllowedIPs:                  []net.IPNet{*allowedIP},
+				PersistentKeepaliveInterval: &keepalive,
+			}},
 		}); err != nil {
-			return fmt.Errorf("failed to set peer: %w", err)
+			return fmt.Errorf("add peer: %w", err)
 		}
-		nm.log.Info("added peer for the first time", "publicKey", publicKey, "endpoint", endpoint)
+		nm.log.Info("added peer", "publicKey", publicKey, "endpoint", endpoint)
 	}
 
-	// Add route for the peer's allowed IPs using netlink
-	dstIP := net.ParseIP(wireguardIp)
-	if dstIP == nil {
-		return fmt.Errorf("failed to parse peer IP: %s", wireguardIp)
-	}
+	// Add route
+	dstIP := net.ParseIP(wireguardIP)
 	route := &netlink.Route{
 		LinkIndex: nm.link.Attrs().Index,
-		Dst: &net.IPNet{
-			IP:   dstIP,
-			Mask: net.CIDRMask(32, 32),
-		},
-		Scope: unix.RT_SCOPE_LINK, // It must be LINK for BIRD to be able to add BGP routes.
+		Dst:       &net.IPNet{IP: dstIP, Mask: net.CIDRMask(32, 32)},
+		Scope:     unix.RT_SCOPE_LINK,
 	}
 	if err := netlink.RouteReplace(route); err != nil {
-		return fmt.Errorf("failed to add route: %w", err)
+		return fmt.Errorf("add route for %s: %w", wireguardIP, err)
 	}
 
-	nm.peerIPListMu.Lock()
-	defer nm.peerIPListMu.Unlock()
-	if nm.peerIPList[wireguardIp] != nil {
-		nm.peerIPList[wireguardIp].PublicKey = publicKey
-		nm.peerIPList[wireguardIp].Endpoint = endpoint
-		return nil
-	}
-	nm.peerIPList[wireguardIp] = &Peer{
-		PublicKey:   publicKey,
-		Endpoint:    endpoint,
-		WireguardIP: wireguardIp,
-	}
+	nm.mu.Lock()
+	nm.peers[wireguardIP] = publicKey
+	nm.mu.Unlock()
 	return nil
 }
 
-// syncAllowedIPs lists routes, builds a map of CIDRs to peer IPs, and updates
-// the allowedIPs of WireGuard peers accordingly.
-func (nm *LinuxNetworkManager) syncAllowedIPs() {
-	// Get routes for our interface using netlink
+// RemovePeer removes a WireGuard peer.
+func (nm *NetworkManager) RemovePeer(ctx context.Context, publicKey string) error {
+	pubKey, err := wgtypes.ParseKey(publicKey)
+	if err != nil {
+		return fmt.Errorf("parse public key: %w", err)
+	}
+
+	if err := nm.wgClient.ConfigureDevice(nm.iface, wgtypes.Config{
+		Peers: []wgtypes.PeerConfig{{PublicKey: pubKey, Remove: true}},
+	}); err != nil {
+		return fmt.Errorf("remove peer: %w", err)
+	}
+
+	nm.mu.Lock()
+	for ip, pk := range nm.peers {
+		if pk == publicKey {
+			dstIP := net.ParseIP(ip)
+			route := &netlink.Route{
+				LinkIndex: nm.link.Attrs().Index,
+				Dst:       &net.IPNet{IP: dstIP, Mask: net.CIDRMask(32, 32)},
+			}
+			if err := netlink.RouteDel(route); err != nil {
+				nm.mu.Unlock()
+				return fmt.Errorf("delete route for %s: %w", ip, err)
+			}
+			delete(nm.peers, ip)
+			break
+		}
+	}
+	nm.mu.Unlock()
+
+	nm.log.Info("removed peer", "publicKey", publicKey)
+	return nil
+}
+
+// CurrentPeers returns the current peer public keys.
+func (nm *NetworkManager) CurrentPeers() map[string]string {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+	result := make(map[string]string)
+	for ip, pk := range nm.peers {
+		result[ip] = pk
+	}
+	return result
+}
+
+func (nm *NetworkManager) syncAllowedIPsLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-nm.done:
+			return
+		case <-ticker.C:
+			nm.syncAllowedIPs()
+		}
+	}
+}
+
+func (nm *NetworkManager) syncAllowedIPs() {
 	routes, err := netlink.RouteList(nm.link, netlink.FAMILY_V4)
 	if err != nil {
-		nm.log.Debug("failed to list routes", "error", err)
 		return
 	}
 
-	// Build a map of gateway IP to CIDRs
-	// Example route: 10.244.23.0/26 via 10.200.0.18
-	peerCIDRs := make(map[string]map[string]struct{})
+	// Map gateway -> CIDRs
+	peerCIDRs := make(map[string][]string)
 	for _, route := range routes {
-		// Skip routes without a gateway (direct routes)
-		if route.Gw == nil {
+		if route.Gw == nil || route.Dst == nil {
 			continue
 		}
-		if route.Dst == nil {
-			continue
-		}
-
-		gateway := route.Gw.String()
-		cidr := route.Dst.String()
-
-		if peerCIDRs[gateway] == nil {
-			peerCIDRs[gateway] = make(map[string]struct{})
-		}
-		peerCIDRs[gateway][cidr] = struct{}{}
+		gw := route.Gw.String()
+		peerCIDRs[gw] = append(peerCIDRs[gw], route.Dst.String())
 	}
 
-	wg := &sync.WaitGroup{}
-	for peerIP := range peerCIDRs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			nm.peerIPListMu.Lock()
-			peer, ok := nm.peerIPList[peerIP]
-			if !ok {
-				nm.log.Info("peer ip detected in routes but not in internal peer map", "peerIP", peerIP)
-				nm.peerIPListMu.Unlock()
-				return
-			}
-			nm.peerIPListMu.Unlock()
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
 
-			pubKey, err := wgtypes.ParseKey(peer.PublicKey)
-			if err != nil {
-				nm.log.Info("failed to parse public key", "peerIP", peerIP, "err", err)
-				return
-			}
+	for peerIP, publicKey := range nm.peers {
+		cidrs, ok := peerCIDRs[peerIP]
+		if !ok {
+			continue
+		}
 
-			udpAddr, err := net.ResolveUDPAddr("udp", peer.Endpoint)
-			if err != nil {
-				nm.log.Info("failed to resolve endpoint", "peerIP", peerIP, "err", err)
-				return
-			}
+		pubKey, _ := wgtypes.ParseKey(publicKey)
+		allowedIPs := []net.IPNet{}
+		_, peerNet, _ := net.ParseCIDR(peerIP + "/32")
+		allowedIPs = append(allowedIPs, *peerNet)
 
-			// Build allowed IPs list
-			allowedIPs := make([]net.IPNet, 0, len(peerCIDRs[peerIP])+1)
-			_, peerIPNet, err := net.ParseCIDR(peer.WireguardIP + "/32")
-			if err != nil {
-				nm.log.Info("failed to parse peer wireguard IP", "peerIP", peerIP, "err", err)
-				return
-			}
-			allowedIPs = append(allowedIPs, *peerIPNet)
-
-			allowedIPStrs := []string{peer.WireguardIP + "/32"}
-			for cidr := range peerCIDRs[peerIP] {
-				_, ipNet, err := net.ParseCIDR(cidr)
-				if err != nil {
-					nm.log.Info("failed to parse CIDR", "cidr", cidr, "err", err)
-					continue
-				}
+		for _, cidr := range cidrs {
+			_, ipNet, err := net.ParseCIDR(cidr)
+			if err == nil {
 				allowedIPs = append(allowedIPs, *ipNet)
-				allowedIPStrs = append(allowedIPStrs, cidr)
 			}
+		}
 
-			if err := nm.wgClient.ConfigureDevice(nm.InterfaceName, wgtypes.Config{
-				Peers: []wgtypes.PeerConfig{
-					{
-						PublicKey:         pubKey,
-						UpdateOnly:        true,
-						Endpoint:          udpAddr,
-						ReplaceAllowedIPs: true,
-						AllowedIPs:        allowedIPs,
-					},
-				},
-			}); err != nil {
-				nm.log.Info("failed to update peer allowed IPs", "peerIP", peerIP, "err", err)
-				return
-			}
-			nm.log.Debug("updated peer allowed IPs", "peerIP", peerIP, "allowedIPs", strings.Join(allowedIPStrs, ","))
-		}()
+		if err := nm.wgClient.ConfigureDevice(nm.iface, wgtypes.Config{
+			Peers: []wgtypes.PeerConfig{{
+				PublicKey:         pubKey,
+				UpdateOnly:        true,
+				ReplaceAllowedIPs: true,
+				AllowedIPs:        allowedIPs,
+			}},
+		}); err != nil {
+			nm.log.Error("failed to sync allowed IPs", "peer", peerIP, "error", err)
+		}
 	}
-	wg.Wait()
 }

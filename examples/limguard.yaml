@@ -1,0 +1,33 @@
+# Platform-specific interface names (defaults shown)
+linuxInterfaceName: wg0     # Used on Linux nodes
+darwinInterfaceName: utun9  # Used on macOS nodes (must be utun[0-9]+)
+
+# Version of limguard to download from GitHub releases.
+# If omitted, the latest release is fetched and written back to this file.
+# version: v1.0.0
+
+nodes:
+    node-1:
+        wireguardIP: 10.200.0.1
+        endpoint: 192.168.104.1:51820  # Must be host:port format
+        # localBinaryPath: /path/to/limguard  # Optional: use local binary instead of downloading
+        ssh:
+            host: 127.0.0.1
+            port: 56614
+            user: muvaf
+            identityFile: ~/.ssh/id_ed25519
+    node-2:
+        wireguardIP: 10.200.0.2
+        endpoint: 192.168.104.3:51820
+        ssh:
+            host: 127.0.0.1
+            port: 56641
+            user: muvaf
+            identityFile: ~/.ssh/id_ed25519
+    # Example local node (uncomment to join mesh from this machine):
+    # ops-laptop:
+    #     wireguardIP: 10.200.0.50
+    #     endpoint: 203.0.113.50:51821  # Use different port to avoid conflicts
+    #     interfaceName: utun9          # Optional: override interface name
+    #     ssh:
+    #         host: self                # Special value: configure locally, no SSH
