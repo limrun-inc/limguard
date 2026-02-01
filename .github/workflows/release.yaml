@@ -60,6 +60,29 @@ jobs:
           # Generate checksums
           cd dist && sha256sum limguard-* > checksums.txt
 
+      - name: Extract checksums
+        id: checksums
+        run: |
+          cd dist
+          # Parse checksums.txt and export as environment variables
+          # Format: "sha256hash  filename"
+          SHA256_darwin_arm64=$(grep 'limguard-darwin-arm64$' checksums.txt | awk '{print $1}')
+          SHA256_darwin_amd64=$(grep 'limguard-darwin-amd64$' checksums.txt | awk '{print $1}')
+          SHA256_linux_arm64=$(grep 'limguard-linux-arm64$' checksums.txt | awk '{print $1}')
+          SHA256_linux_amd64=$(grep 'limguard-linux-amd64$' checksums.txt | awk '{print $1}')
+          
+          # Fail if any checksum is missing
+          if [[ -z "$SHA256_darwin_arm64" || -z "$SHA256_darwin_amd64" || -z "$SHA256_linux_arm64" || -z "$SHA256_linux_amd64" ]]; then
+            echo "Error: Missing checksum(s) in checksums.txt"
+            cat checksums.txt
+            exit 1
+          fi
+          
+          echo "SHA256_darwin_arm64=$SHA256_darwin_arm64" >> $GITHUB_OUTPUT
+          echo "SHA256_darwin_amd64=$SHA256_darwin_amd64" >> $GITHUB_OUTPUT
+          echo "SHA256_linux_arm64=$SHA256_linux_arm64" >> $GITHUB_OUTPUT
+          echo "SHA256_linux_amd64=$SHA256_linux_amd64" >> $GITHUB_OUTPUT
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -68,3 +91,36 @@ jobs:
             --title "${{ inputs.version }}" \
             --generate-notes \
             dist/*
+
+      - name: Generate token for Homebrew tap
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.LIMRUNBOTAPP_APP_ID }}
+          private-key: ${{ secrets.LIMRUNBOTAPP_APP_PRIVATE_KEY }}
+          owner: limrun-inc
+          repositories: homebrew-tap
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: limrun-inc/homebrew-tap
+          token: ${{ steps.generate-token.outputs.token }}
+          path: tap
+
+      - name: Update Homebrew formula
+        run: |
+          cd tap
+          sed -i 's/version ".*"/version "${{ inputs.version }}"/g' Formula/limguard.rb
+          sed -i '/# replace_with_darwin_arm64_sha256/ s/sha256 "[^"]*"/sha256 "${{ steps.checksums.outputs.SHA256_darwin_arm64 }}"/' Formula/limguard.rb
+          sed -i '/# replace_with_darwin_amd64_sha256/ s/sha256 "[^"]*"/sha256 "${{ steps.checksums.outputs.SHA256_darwin_amd64 }}"/' Formula/limguard.rb
+          sed -i '/# replace_with_linux_arm64_sha256/ s/sha256 "[^"]*"/sha256 "${{ steps.checksums.outputs.SHA256_linux_arm64 }}"/' Formula/limguard.rb
+          sed -i '/# replace_with_linux_amd64_sha256/ s/sha256 "[^"]*"/sha256 "${{ steps.checksums.outputs.SHA256_linux_amd64 }}"/' Formula/limguard.rb
+
+      - name: Commit to Homebrew tap
+        uses: actions-js/push@v1.5
+        with:
+          github_token: ${{ steps.generate-token.outputs.token }}
+          repository: limrun-inc/homebrew-tap
+          directory: tap
+          message: "Update limguard to ${{ inputs.version }}"
