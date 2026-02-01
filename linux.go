@@ -148,7 +148,9 @@ func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wire
 		Dst:       &net.IPNet{IP: dstIP, Mask: net.CIDRMask(32, 32)},
 		Scope:     unix.RT_SCOPE_LINK,
 	}
-	netlink.RouteReplace(route)
+	if err := netlink.RouteReplace(route); err != nil {
+		return fmt.Errorf("add route for %s: %w", wireguardIP, err)
+	}
 
 	nm.mu.Lock()
 	nm.peers[wireguardIP] = publicKey
@@ -177,7 +179,10 @@ func (nm *NetworkManager) RemovePeer(ctx context.Context, publicKey string) erro
 				LinkIndex: nm.link.Attrs().Index,
 				Dst:       &net.IPNet{IP: dstIP, Mask: net.CIDRMask(32, 32)},
 			}
-			netlink.RouteDel(route)
+			if err := netlink.RouteDel(route); err != nil {
+				nm.mu.Unlock()
+				return fmt.Errorf("delete route for %s: %w", ip, err)
+			}
 			delete(nm.peers, ip)
 			break
 		}
@@ -249,13 +254,15 @@ func (nm *NetworkManager) syncAllowedIPs() {
 			}
 		}
 
-		nm.wgClient.ConfigureDevice(nm.iface, wgtypes.Config{
+		if err := nm.wgClient.ConfigureDevice(nm.iface, wgtypes.Config{
 			Peers: []wgtypes.PeerConfig{{
 				PublicKey:         pubKey,
 				UpdateOnly:        true,
 				ReplaceAllowedIPs: true,
 				AllowedIPs:        allowedIPs,
 			}},
-		})
+		}); err != nil {
+			nm.log.Error("failed to sync allowed IPs", "peer", peerIP, "error", err)
+		}
 	}
 }

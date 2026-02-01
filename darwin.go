@@ -165,7 +165,9 @@ func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wire
 	ifaceRe := regexp.MustCompile(`interface:\s*` + regexp.QuoteMeta(nm.iface) + `(\s|$)`)
 	out, err := exec.Command("route", "-n", "get", wireguardIP).CombinedOutput()
 	if err != nil || !ifaceRe.Match(out) {
-		exec.Command("route", "-n", "add", "-host", wireguardIP, "-interface", nm.iface).Run()
+		if routeOut, routeErr := exec.Command("route", "-n", "add", "-host", wireguardIP, "-interface", nm.iface).CombinedOutput(); routeErr != nil {
+			return fmt.Errorf("add route for %s: %s: %w", wireguardIP, routeOut, routeErr)
+		}
 	}
 
 	nm.mu.Lock()
@@ -190,7 +192,10 @@ func (nm *NetworkManager) RemovePeer(ctx context.Context, publicKey string) erro
 	nm.mu.Lock()
 	for ip, pk := range nm.peers {
 		if pk == publicKey {
-			exec.Command("route", "-n", "delete", "-host", ip).Run()
+			if out, err := exec.Command("route", "-n", "delete", "-host", ip).CombinedOutput(); err != nil {
+				nm.mu.Unlock()
+				return fmt.Errorf("delete route for %s: %s: %w", ip, out, err)
+			}
 			delete(nm.peers, ip)
 			break
 		}
@@ -284,14 +289,16 @@ func (nm *NetworkManager) syncAllowedIPs() {
 			}
 		}
 
-		nm.wgClient.ConfigureDevice(nm.iface, wgtypes.Config{
+		if err := nm.wgClient.ConfigureDevice(nm.iface, wgtypes.Config{
 			Peers: []wgtypes.PeerConfig{{
 				PublicKey:         pubKey,
 				UpdateOnly:        true,
 				ReplaceAllowedIPs: true,
 				AllowedIPs:        allowedIPs,
 			}},
-		})
+		}); err != nil {
+			nm.log.Error("failed to sync allowed IPs", "peer", peerIP, "error", err)
+		}
 	}
 }
 
