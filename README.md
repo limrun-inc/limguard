@@ -103,8 +103,8 @@ To disconnect, remove the node from config and re-run `apply`. Other nodes will 
 ## How It Works
 
 - Each node runs `limguard run` as a service
-- The daemon watches `/etc/limguard/limguard.yaml` for changes
-- When config changes, it reconciles peers (add/update/remove)
+- The daemon loads config on startup and configures WireGuard peers
+- To update peers, restart the service after updating the config file
 - Routes through the WireGuard interface are synced to allowed IPs
 
 ## Versioning

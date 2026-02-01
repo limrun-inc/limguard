@@ -37,20 +37,12 @@ Ensure you have an SSH key at `~/.ssh/id_ed25519` or `~/.ssh/id_rsa`.
 
 ## Running Tests
 
-### Basic Integration Test (Two VMs)
-
-Tests mesh connectivity between two Lima VMs:
-
-```bash
-./integration.sh
-```
-
-### Integration Test with Local Node
+### End-to-End Test (Two VMs + Local Node)
 
 Tests mesh connectivity between two Lima VMs and your local machine. Uses `wg-quick` to bring up the generated WireGuard config and ping peers:
 
 ```bash
-sudo ./integration-local.sh
+sudo ./e2e.sh
 ```
 
 **Note:** Requires `wireguard-tools` (`brew install wireguard-tools`) and sudo for WireGuard operations.
@@ -60,8 +52,7 @@ sudo ./integration-local.sh
 Keep VMs after test for debugging:
 
 ```bash
-CLEANUP=0 ./integration.sh
-sudo CLEANUP=0 ./integration-local.sh
+sudo CLEANUP=0 ./e2e.sh
 ```
 
 ## Manual Cleanup

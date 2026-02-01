@@ -1,94 +1,16 @@
 # Operations
 
-## Manual Installation
+## Joining the Mesh from Your Laptop
 
-If not using `limguard deploy`:
+To temporarily join the mesh from your local machine for debugging or operations:
 
-### Linux (systemd)
-
-```bash
-# Install binary
-sudo cp limguard /usr/local/bin/
-sudo chmod +x /usr/local/bin/limguard
-
-# Create config directory
-sudo mkdir -p /etc/limguard
-
-# Create systemd service
-sudo tee /etc/systemd/system/limguard.service << 'EOF'
-[Unit]
-Description=limguard WireGuard mesh network manager
-After=network-online.target
-Before=kubelet.service
-
-[Service]
-ExecStartPre=/sbin/modprobe wireguard || true
-ExecStart=/usr/local/bin/limguard run --config /etc/limguard/limguard.yaml --node-name %H
-Restart=always
-RestartSec=5
-AmbientCapabilities=CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Enable and start
-sudo systemctl daemon-reload
-sudo systemctl enable --now limguard
-```
-
-### macOS (launchd)
-
-```bash
-# Install wireguard-go
-brew install wireguard-go
-
-# Install binary
-sudo cp limguard /usr/local/bin/
-
-# Create config directory
-sudo mkdir -p /etc/limguard
-
-# Create launchd plist
-sudo tee /Library/LaunchDaemons/com.limrun.limguard.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.limrun.limguard</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/limguard</string>
-        <string>run</string>
-        <string>--config</string>
-        <string>/etc/limguard/limguard.yaml</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-</dict>
-</plist>
-EOF
-
-# Load service
-sudo launchctl load /Library/LaunchDaemons/com.limrun.limguard.plist
-```
-
-## Adding a Node
-
-1. Add the node to your `limguard.yaml`:
+1. Add a local node to your `limguard.yaml`:
    ```yaml
    nodes:
-     new-node:
-       wireguardIP: "10.200.0.10"
-       endpoint: "203.0.113.20"
+     ops-laptop:
+       wireguardIP: "10.200.0.50"
        ssh:
-         host: "203.0.113.20"
-         user: root
+         host: self
    ```
 
 2. Run apply:
@@ -96,96 +18,83 @@ sudo launchctl load /Library/LaunchDaemons/com.limrun.limguard.plist
    limguard apply --config limguard.yaml
    ```
 
-## Joining the Mesh Locally
+3. Import the generated `ops-laptop-peer.conf` into WireGuard app (macOS, Windows, iOS, Android)
 
-To temporarily join the mesh from your local machine (e.g., for operations or debugging):
+4. Activate the tunnel in the WireGuard app
 
-1. Add a local node to your config with `ssh.host: self`:
+## Leaving the Mesh
+
+1. Deactivate the tunnel in the WireGuard app
+
+2. Mark your node for deletion in `limguard.yaml`:
    ```yaml
    nodes:
      ops-laptop:
+       action: Delete
        wireguardIP: "10.200.0.50"
-       endpoint: "your.public.ip"
        ssh:
-         host: self    # Special value: configure locally, no SSH
+         host: self
    ```
 
-2. Run apply with root privileges:
+3. Run apply to remove yourself from all remote nodes:
    ```bash
-   sudo limguard apply --config limguard.yaml
+   limguard apply --config limguard.yaml
    ```
 
-This will:
-- Install the binary and config locally
-- Start the limguard service on the local machine
-- Add the local node as a peer on all other nodes
+4. After successful apply, you can remove the node entry from the config entirely
 
-**Note:** Only one local node (`ssh.host: self`) is allowed per config.
+## Inspecting Nodes
 
-## Removing a Node
+### Service Status
 
-1. Remove from `limguard.yaml`
-2. Run `limguard apply --config limguard.yaml`
-3. All remaining nodes receive the updated config and automatically remove the peer
-
-For local nodes: removing the node from config and running `apply` will update all remote nodes. To fully clean up the local machine, also stop and disable the service:
-```bash
-# Linux
-sudo systemctl stop limguard
-sudo systemctl disable limguard
-
-# macOS
-sudo launchctl unload /Library/LaunchDaemons/com.limrun.limguard.plist
-```
-
-## Key Rotation
-
-1. Stop daemon on the node
-2. Remove peer from all other nodes:
-   ```bash
-   wg set wg0 peer OLD_PUBLIC_KEY remove
-   ```
-3. Generate new key:
-   ```bash
-   rm /etc/limguard/privatekey
-   wg genkey > /etc/limguard/privatekey
-   chmod 600 /etc/limguard/privatekey
-   ```
-4. Update `publicKey` in config on all nodes
-5. Restart daemon
-
-## Troubleshooting
-
-Check status:
 ```bash
 # Linux
 systemctl status limguard
 journalctl -u limguard -f
 
 # macOS
-tail -f /var/log/limguard.log
+cat /var/log/limguard.log
+```
 
-# Both
+### WireGuard Status
+
+```bash
+# Show interface and all peers
 wg show
+
+# Show just the public key
+wg show wg0 public-key
 ```
 
-Common issues:
-- **No handshake**: Check UDP 51820 is open, public keys match
-- **Interface missing**: Ensure wireguard module loaded (Linux) or wireguard-go installed (macOS)
-- **Config not reloading**: Check file permissions, restart daemon
-
-## Health Checks
+### Config and Keys
 
 ```bash
-curl http://localhost:8081/healthz
-curl http://localhost:8081/readyz
+# View config
+cat /etc/limguard/limguard.yaml
+
+# View public key
+cat /etc/limguard/privatekey.pub
 ```
 
-## Backup
+### Network
 
-Only the private key needs backup:
 ```bash
-/etc/limguard/privatekey
+# Check interface exists
+ip addr show wg0          # Linux
+ifconfig utun9            # macOS
+
+# Ping a peer
+ping 10.200.0.1
+
+# Check routes
+ip route | grep wg0       # Linux
+netstat -rn | grep utun9  # macOS
 ```
 
-If lost, follow key rotation procedure.
+## Common Issues
+
+| Symptom | Check |
+|---------|-------|
+| No handshake | UDP 51820 open? Public keys match? |
+| Interface missing | `modprobe wireguard` (Linux) or `brew install wireguard-go` (macOS) |
+| Peers not updating | Restart service after config change |
