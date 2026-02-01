@@ -126,7 +126,7 @@ check_prerequisites() {
     log "Using SSH key: $SSH_KEY"
 }
 
-# Create and start a VM
+# Create a VM (without starting)
 create_vm() {
     local name=$1
     
@@ -142,8 +142,12 @@ create_vm() {
             --network=lima:shared \
             --yes
     fi
+}
+
+# Start a VM and wait for it to be ready
+start_vm() {
+    local name=$1
     
-    # Start the VM (limactl create doesn't start it)
     log "Starting VM $name..."
     limactl_cmd start "$name" || true
     
@@ -332,24 +336,22 @@ main() {
     
     check_prerequisites
     
-    # Initialize Lima config directory before parallel VM creation
-    # (prevents race condition when both VMs try to create ~/.lima/_config/user)
-    log "Initializing Lima..."
-    limactl_cmd list >/dev/null 2>&1 || true
+    # Step 1: Create VMs sequentially (avoids race condition in Lima config init)
+    create_vm "$NODE1"
+    create_vm "$NODE2"
     
-    # Step 1: Create and start VMs in parallel
-    log "Creating VMs in parallel..."
-    create_vm "$NODE1" &
+    # Step 2: Start VMs in parallel
+    log "Starting VMs in parallel..."
+    start_vm "$NODE1" &
     pid1=$!
-    create_vm "$NODE2" &
+    start_vm "$NODE2" &
     pid2=$!
     
-    # Wait for both VMs to be ready
-    wait $pid1 || { error "Failed to create $NODE1"; exit 1; }
-    wait $pid2 || { error "Failed to create $NODE2"; exit 1; }
+    wait $pid1 || { error "Failed to start $NODE1"; exit 1; }
+    wait $pid2 || { error "Failed to start $NODE2"; exit 1; }
     log "Both VMs are ready"
     
-    # Step 2: Get VM info
+    # Step 3: Get VM info
     SSH_PORT1=$(get_ssh_port "$NODE1")
     SSH_PORT2=$(get_ssh_port "$NODE2")
     ENDPOINT1=$(get_vm_ip "$NODE1")
@@ -359,7 +361,7 @@ main() {
     log "Node 2: SSH port=$SSH_PORT2, endpoint=$ENDPOINT2"
     log "Local node: WireGuard client (no daemon)"
     
-    # Step 3: Enable SSH access in parallel
+    # Step 4: Enable SSH access in parallel
     log "Enabling SSH access in parallel..."
     enable_ssh_access "$NODE1" &
     pid1=$!
@@ -367,20 +369,20 @@ main() {
     pid2=$!
     wait $pid1 $pid2
     
-    # Step 4: Build binaries (only Linux needed for VMs)
+    # Step 5: Build binaries (only Linux needed for VMs)
     build_binaries
     
-    # Step 5: Create config
+    # Step 6: Create config
     create_config "$SSH_PORT1" "$SSH_PORT2" "$ENDPOINT1" "$ENDPOINT2"
     
-    # Step 6: Run apply
+    # Step 7: Run apply
     run_apply
     
-    # Step 7: Check services on VMs
+    # Step 8: Check services on VMs
     check_service "$NODE1"
     check_service "$NODE2"
     
-    # Step 8: Test local node connectivity
+    # Step 9: Test local node connectivity
     test_local_connectivity
     
     echo ""
