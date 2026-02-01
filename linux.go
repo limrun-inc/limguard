@@ -27,6 +27,7 @@ type NetworkManager struct {
 	peers    map[string]string // wireguardIP -> publicKey
 	mu       sync.RWMutex
 	log      *slog.Logger
+	done     chan struct{}
 }
 
 // NewNetworkManager creates the WireGuard interface and configures it.
@@ -86,10 +87,17 @@ func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP
 		link:     link,
 		peers:    make(map[string]string),
 		log:      log,
+		done:     make(chan struct{}),
 	}
 
 	go nm.syncAllowedIPsLoop()
 	return nm, nil
+}
+
+// Close stops the NetworkManager and releases resources.
+func (nm *NetworkManager) Close() error {
+	close(nm.done)
+	return nm.wgClient.Close()
 }
 
 // SetPeer adds or updates a WireGuard peer.
@@ -130,7 +138,7 @@ func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wire
 		}); err != nil {
 			return fmt.Errorf("add peer: %w", err)
 		}
-		nm.log.Info("added peer", "publicKey", truncateKey(publicKey), "endpoint", endpoint)
+		nm.log.Info("added peer", "publicKey", publicKey, "endpoint", endpoint)
 	}
 
 	// Add route
@@ -176,16 +184,8 @@ func (nm *NetworkManager) RemovePeer(ctx context.Context, publicKey string) erro
 	}
 	nm.mu.Unlock()
 
-	nm.log.Info("removed peer", "publicKey", truncateKey(publicKey))
+	nm.log.Info("removed peer", "publicKey", publicKey)
 	return nil
-}
-
-// truncateKey returns a truncated version of a public key for logging.
-func truncateKey(key string) string {
-	if len(key) > 8 {
-		return key[:8] + "..."
-	}
-	return key
 }
 
 // CurrentPeers returns the current peer public keys.
@@ -201,8 +201,14 @@ func (nm *NetworkManager) CurrentPeers() map[string]string {
 
 func (nm *NetworkManager) syncAllowedIPsLoop() {
 	ticker := time.NewTicker(5 * time.Second)
-	for range ticker.C {
-		nm.syncAllowedIPs()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-nm.done:
+			return
+		case <-ticker.C:
+			nm.syncAllowedIPs()
+		}
 	}
 }
 

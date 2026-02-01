@@ -2,13 +2,31 @@
 
 This guide covers testing limguard using Lima VMs on macOS.
 
-## Prerequisites
+## Automated Integration Test
+
+The easiest way to run the full integration test:
+
+```bash
+# Run the integration test (creates VMs, deploys, verifies, cleans up)
+go test -tags=integration -v -timeout=10m
+
+# Keep VMs after test for debugging
+LIMGUARD_TEST_NO_CLEANUP=1 go test -tags=integration -v -timeout=10m
+```
+
+The test is idempotent - it will reuse existing VMs if they exist.
+
+## Manual Testing
+
+If you prefer to run the steps manually, follow the guide below.
+
+### Prerequisites
 
 - Go 1.21+
 - Lima (`brew install lima`)
 - SSH key pair (`~/.ssh/id_ed25519` or `~/.ssh/id_rsa`)
 
-## 1. Create Lima VMs
+### 1. Create Lima VMs
 
 Create two Ubuntu VMs with user-v2 networking (enables VM-to-VM communication):
 
@@ -24,7 +42,7 @@ limactl start node-1
 limactl start node-2
 ```
 
-## 2. Get VM Information
+### 2. Get VM Information
 
 Get the endpoint and SSH information to use in config file:
 
@@ -43,7 +61,7 @@ echo "Endpoing for node-2: $(limactl shell node-2 -- ip addr show eth0 | grep 'i
 
 Note both the SSH ports and VM IPs.
 
-## 3. Enable SSH Access
+### 3. Enable SSH Access
 
 Copy your SSH key to each VM:
 
@@ -53,20 +71,20 @@ limactl shell node-1 -- bash -c "mkdir -p ~/.ssh && echo '$(cat ~/.ssh/id_ed2551
 limactl shell node-2 -- bash -c "mkdir -p ~/.ssh && echo '$(cat ~/.ssh/id_ed25519.pub)' >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
 ```
 
-## 4. Build limguard Binaries
+### 4. Build limguard Binaries
 
 ```bash
 # From the limguard repo root
 mkdir -p dist
 
 # Build for Linux ARM64 (Lima on Apple Silicon)
-GOOS=linux GOARCH=arm64 go build -o dist/limguard-linux-arm64 ./cmd/main.go
+GOOS=linux GOARCH=arm64 go build -o dist/limguard-linux-arm64 ./cmd/limguard/
 
 # Build for Linux AMD64 (Lima on Intel Mac)
-GOOS=linux GOARCH=amd64 go build -o dist/limguard-linux-amd64 ./cmd/main.go
+GOOS=linux GOARCH=amd64 go build -o dist/limguard-linux-amd64 ./cmd/limguard/
 ```
 
-## 5. Create Test Config
+### 5. Create Test Config
 
 Create `test-limguard.yaml` with the values from step 2:
 
@@ -104,13 +122,13 @@ Replace:
 - `SSH_PORT_1`, `SSH_PORT_2` with the SSH ports from step 2
 - `YOUR_USERNAME` with your macOS username
 
-## 6. Run Apply
+### 6. Run Apply
 
 ```bash
-go run ./cmd/main.go apply --config test-limguard.yaml
+go run ./cmd/limguard/ apply --config test-limguard.yaml
 ```
 
-## 7. Verify the Mesh
+### 7. Verify the Mesh
 
 ```bash
 # Ping node-2 from node-1 via WireGuard tunnel
@@ -120,7 +138,7 @@ limactl shell node-1 -- ping -c 3 10.200.0.2
 limactl shell node-2 -- ping -c 3 10.200.0.1
 ```
 
-## 8. Check Service Status
+### 8. Check Service Status
 
 ```bash
 # Check limguard service status
@@ -131,7 +149,9 @@ limactl shell node-2 -- sudo systemctl status limguard --no-pager
 limactl shell node-1 -- sudo journalctl -u limguard -n 20 --no-pager
 ```
 
-## 9. Cleanup
+### 9. Cleanup
+
+For manual test VMs:
 
 ```bash
 # Stop and delete VMs
@@ -142,6 +162,13 @@ limactl delete node-2
 
 # Remove test config
 rm test-limguard.yaml
+```
+
+For integration test VMs (if `LIMGUARD_TEST_NO_CLEANUP=1` was used):
+
+```bash
+limactl stop limguard-test-1 limguard-test-2
+limactl delete limguard-test-1 limguard-test-2
 ```
 
 ## Troubleshooting

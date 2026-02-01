@@ -4,57 +4,59 @@ WireGuard mesh network daemon. Single YAML config used for both deployment and r
 
 ## Files
 
-- `cmd/main.go` - CLI: run, apply commands
-- `config/config.go` - YAML config loading/validation
-- `linux.go` / `darwin.go` - Platform-specific WireGuard management
+- `cmd/limguard/main.go` - CLI entrypoint (thin wrapper)
+- `config.go` - YAML config loading/validation, constants
+- `version.go` - Version variable (set at build time)
+- `run.go` - Run command: daemon lifecycle, config watching, peer reconciliation
+- `deploy.go` - Apply command: SSH/SFTP helpers, service installation
+- `linux.go` / `darwin.go` - Platform-specific WireGuard NetworkManager
 
 ## Call Flow
 
 ```mermaid
 flowchart TD
-    subgraph main
-        M[main] --> cmdRun
-        M --> cmdApply
+    subgraph main[cmd/limguard/main.go]
+        M[main] --> limguard.Run
+        M --> limguard.Apply
     end
 
-    subgraph run_command[run command - idempotent]
-        cmdRun --> config.Load
-        cmdRun --> config.Validate
-        cmdRun --> config.GetSelf
-        cmdRun --> config.EnsurePrivateKey
-        config.EnsurePrivateKey -->|writes| PubkeyFile[privatekey.pub]
-        cmdRun --> verifyPubkey[verify self pubkey matches]
-        cmdRun --> NewNetworkManager
-        cmdRun --> reconcilePeers
-        cmdRun --> fsnotify[fsnotify.Watcher]
-        fsnotify -->|on_change| config.Load
+    subgraph run_command[Run - run.go]
+        limguard.Run --> LoadConfig
+        limguard.Run --> Config.Validate
+        limguard.Run --> Config.GetSelf
+        limguard.Run --> EnsurePrivateKey
+        EnsurePrivateKey -->|writes| PubkeyFile[privatekey.pub]
+        limguard.Run --> verifyPubkey[verify self pubkey matches]
+        limguard.Run --> NewNetworkManager
+        limguard.Run --> reconcilePeers
+        limguard.Run --> fsnotify[fsnotify.Watcher]
+        fsnotify -->|on_change| LoadConfig
         fsnotify -->|on_change| reconcilePeers
-        reconcilePeers --> config.GetPeers
+        reconcilePeers --> Config.GetPeers
         reconcilePeers -->|skip if no pubkey| nm.SetPeer
         reconcilePeers --> nm.RemovePeer
     end
 
-    subgraph apply_command
-        cmdApply --> config.Load
-        cmdApply --> config.ValidateForDeploy
+    subgraph apply_command[Apply - deploy.go]
+        limguard.Apply --> LoadConfig
+        limguard.Apply --> Config.ValidateForDeploy
 
-        cmdApply --> Pass1[Pass1: Start services]
+        limguard.Apply --> Pass1[Pass1: Start services]
         Pass1 --> sshConnect
         Pass1 --> detectPlatform
         Pass1 --> fileSHA256[SHA256 hash check]
-        fileSHA256 -->|if changed| scpFile
-        Pass1 --> writeRemoteFile
+        fileSHA256 -->|if changed| sftpCopyFile
+        Pass1 --> sftpWriteFile
         Pass1 --> installLinuxService
         Pass1 --> installDarwinService
         Pass1 --> waitForPubkey
         waitForPubkey -->|reads| PubkeyFile
 
-        cmdApply --> config.Save
+        limguard.Apply --> Config.Save
         
-        cmdApply --> Pass2[Pass2: Distribute and restart]
-        Pass2 --> sshConnect
-        Pass2 --> writeRemoteFile
-        Pass2 --> restartService[systemctl restart]
+        limguard.Apply --> Pass2[Pass2: Distribute and restart]
+        Pass2 --> sftpWriteFile
+        Pass2 --> runAsRoot[runAsRoot - stdin piped]
     end
 
     subgraph network_manager[NetworkManager linux.go/darwin.go]
@@ -64,6 +66,7 @@ flowchart TD
         nm.RemovePeer --> ConfigureDevice
         NewNetworkManager --> syncAllowedIPsLoop
         syncAllowedIPsLoop --> syncAllowedIPs
+        nm.Close --> wgClient.Close
     end
 ```
 

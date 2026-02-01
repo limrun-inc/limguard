@@ -1,7 +1,9 @@
-package config
+package limguard
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Default configuration values.
 const (
 	DefaultListenPort     = 51820
 	DefaultPrivateKeyPath = "/etc/limguard/privatekey"
@@ -19,6 +22,7 @@ const (
 	DefaultBinaryPath     = "/usr/local/bin/limguard"
 )
 
+// DefaultInterfaceName returns the default WireGuard interface name for the current platform.
 func DefaultInterfaceName() string {
 	if runtime.GOOS == "darwin" {
 		return "utun5"
@@ -53,8 +57,8 @@ type Config struct {
 	Nodes          map[string]Node `yaml:"nodes"`
 }
 
-// Load reads and validates a config file.
-func Load(path string) (*Config, error) {
+// LoadConfig reads and parses a config file.
+func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -127,19 +131,13 @@ func (c *Config) Validate() error {
 
 // ValidateForDeploy checks the config for deployment (SSH info required, public keys optional).
 func (c *Config) ValidateForDeploy() error {
-	if len(c.Nodes) == 0 {
-		return fmt.Errorf("no nodes defined")
+	if err := c.Validate(); err != nil {
+		return err
 	}
 	if c.ArtifactDir == "" {
 		return fmt.Errorf("artifactDir required for deploy")
 	}
 	for name, node := range c.Nodes {
-		if node.WireguardIP == "" {
-			return fmt.Errorf("node %q: wireguardIP required", name)
-		}
-		if node.Endpoint == "" {
-			return fmt.Errorf("node %q: endpoint required", name)
-		}
 		if node.SSH == nil || node.SSH.Host == "" {
 			return fmt.Errorf("node %q: ssh.host required for deploy", name)
 		}
@@ -165,11 +163,15 @@ func (c *Config) GetPeers(selfName string) map[string]Node {
 }
 
 // EndpointWithPort returns endpoint with port appended if not present.
+// Handles both IPv4 and IPv6 addresses correctly.
 func (c *Config) EndpointWithPort(endpoint string) string {
-	if strings.Contains(endpoint, ":") {
+	// Try to split as host:port first
+	if _, _, err := net.SplitHostPort(endpoint); err == nil {
+		// Already has port
 		return endpoint
 	}
-	return fmt.Sprintf("%s:%d", endpoint, c.ListenPort)
+	// No port, add default
+	return net.JoinHostPort(endpoint, fmt.Sprintf("%d", c.ListenPort))
 }
 
 // Save writes the config back to the given path.
@@ -190,19 +192,26 @@ func (c *Config) ToYAML() ([]byte, error) {
 }
 
 // EnsurePrivateKey reads or generates a WireGuard private key.
+// Returns an error if the file exists but cannot be read or parsed.
 func EnsurePrivateKey(keyPath string) (wgtypes.Key, error) {
-	if data, err := os.ReadFile(keyPath); err == nil {
+	data, err := os.ReadFile(keyPath)
+	if err == nil {
 		return wgtypes.ParseKey(strings.TrimSpace(string(data)))
 	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return wgtypes.Key{}, fmt.Errorf("read private key: %w", err)
+	}
+
+	// File doesn't exist, generate new key
 	key, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
-		return wgtypes.Key{}, err
+		return wgtypes.Key{}, fmt.Errorf("generate private key: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(keyPath), 0700); err != nil {
-		return wgtypes.Key{}, err
+		return wgtypes.Key{}, fmt.Errorf("create key directory: %w", err)
 	}
 	if err := os.WriteFile(keyPath, []byte(key.String()), 0600); err != nil {
-		return wgtypes.Key{}, err
+		return wgtypes.Key{}, fmt.Errorf("write private key: %w", err)
 	}
 	return key, nil
 }
