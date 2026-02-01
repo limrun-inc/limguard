@@ -36,7 +36,6 @@ nodes:
     # Example local node (uncomment to join mesh from this machine):
     # ops-laptop:
     #     wireguardIP: 10.200.0.50
-    #     endpoint: 203.0.113.50:51821  # Use different port to avoid conflicts
     #     interfaceName: utun9          # Optional: override interface name
     #     ssh:
     #         host: self                # Special value: configure locally, no SSH

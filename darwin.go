@@ -141,9 +141,14 @@ func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wire
 	}
 
 	if !exists {
-		udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
-		if err != nil {
-			return fmt.Errorf("resolve endpoint: %w", err)
+		// Resolve endpoint if provided (empty for NAT'd peers that initiate connections)
+		var udpAddr *net.UDPAddr
+		if endpoint != "" {
+			var err error
+			udpAddr, err = net.ResolveUDPAddr("udp", endpoint)
+			if err != nil {
+				return fmt.Errorf("resolve endpoint: %w", err)
+			}
 		}
 		_, allowedIP, _ := net.ParseCIDR(wireguardIP + "/32")
 		keepalive := 25 * time.Second
@@ -158,7 +163,11 @@ func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wire
 		}); err != nil {
 			return fmt.Errorf("add peer: %w", err)
 		}
-		nm.log.Info("added peer", "publicKey", publicKey, "endpoint", endpoint)
+		if endpoint == "" {
+			nm.log.Info("added peer (no endpoint - will accept incoming)", "publicKey", publicKey)
+		} else {
+			nm.log.Info("added peer", "publicKey", publicKey, "endpoint", endpoint)
+		}
 	}
 
 	// Add route if needed

@@ -20,6 +20,7 @@ const (
 	DefaultPrivateKeyPath = "/etc/limguard/privatekey"
 	DefaultConfigPath     = "/etc/limguard/limguard.yaml"
 	DefaultBinaryPath     = "/usr/local/bin/limguard"
+	DefaultListenPort     = 51820
 )
 
 // DefaultLinuxInterfaceName is the default WireGuard interface name on Linux.
@@ -61,6 +62,11 @@ type Node struct {
 // IsDelete returns true if the node is marked for deletion.
 func (n Node) IsDelete() bool {
 	return n.Action == NodeActionDelete
+}
+
+// IsLocal returns true if this is a local node (ssh.host: self).
+func (n Node) IsLocal() bool {
+	return n.SSH != nil && strings.EqualFold(n.SSH.Host, "self")
 }
 
 // Config is the unified configuration for limguard.
@@ -119,10 +125,15 @@ func (c *Config) InterfaceName(nodeName string) string {
 }
 
 // NodeListenPort parses and returns the WireGuard listen port from a node's endpoint.
+// Returns DefaultListenPort if endpoint is empty (for local nodes behind NAT).
 func (c *Config) NodeListenPort(nodeName string) (int, error) {
 	node, ok := c.Nodes[nodeName]
 	if !ok {
 		return 0, fmt.Errorf("node %q not found", nodeName)
+	}
+	// Local nodes can omit endpoint - use default port
+	if node.Endpoint == "" {
+		return DefaultListenPort, nil
 	}
 	_, portStr, err := net.SplitHostPort(node.Endpoint)
 	if err != nil {
@@ -153,12 +164,12 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate wireguardIP %q: %q and %q", node.WireguardIP, other, name)
 		}
 		seenIPs[node.WireguardIP] = name
-		if node.Endpoint == "" {
-			return fmt.Errorf("node %q: endpoint required", name)
-		}
-		// Validate endpoint is host:port format
-		if _, _, err := net.SplitHostPort(node.Endpoint); err != nil {
-			return fmt.Errorf("node %q: endpoint must be host:port format (got %q)", name, node.Endpoint)
+		// Endpoint is optional (for NAT'd nodes that initiate connections to peers).
+		// If provided, validate it's in host:port format.
+		if node.Endpoint != "" {
+			if _, _, err := net.SplitHostPort(node.Endpoint); err != nil {
+				return fmt.Errorf("node %q: endpoint must be host:port format (got %q)", name, node.Endpoint)
+			}
 		}
 		// Skip publicKey validation if empty (bootstrap mode for self node)
 		// Non-empty publicKeys must be valid
@@ -179,6 +190,11 @@ func (c *Config) ValidateForDeploy() error {
 	for name, node := range c.Nodes {
 		if node.SSH == nil || node.SSH.Host == "" {
 			return fmt.Errorf("node %q: ssh.host required for deploy", name)
+		}
+		// Endpoint is required for non-local nodes (we need to reach them and configure peers).
+		// Local nodes can omit endpoint - they're behind NAT and initiate connections.
+		if node.Endpoint == "" && !node.IsLocal() {
+			return fmt.Errorf("node %q: endpoint required (only local nodes can omit endpoint)", name)
 		}
 	}
 	return nil
