@@ -111,3 +111,22 @@ sequenceDiagram
     Node1->>Node2: WireGuard peers configured
     Node2->>Node1: WireGuard peers configured
 ```
+
+## Local Nodes (WireGuard GUI Clients)
+
+Nodes with `ssh.host: self` are treated as local WireGuard clients:
+- No daemon or service is installed
+- Private key is generated in `~/.limguard/privatekey`
+- Public key is distributed to all remote nodes as a peer
+- A WireGuard INI config is written to `<node-name>-peer.conf` (customizable via `--local-wireguard-conf-path`)
+
+Example config entry:
+```yaml
+nodes:
+    ops-laptop:
+        wireguardIP: 10.200.0.50
+        ssh:
+            host: self
+```
+
+After `limguard apply`, import the generated `.conf` file into the WireGuard app on macOS, Windows, iOS, or Android.

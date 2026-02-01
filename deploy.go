@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -26,9 +27,10 @@ import (
 
 // ApplyOptions holds options for the Apply command.
 type ApplyOptions struct {
-	ConfigPath string
-	SSHKeyPath string
-	Debug      bool
+	ConfigPath      string
+	SSHKeyPath      string
+	LocalWGConfPath string
+	Debug           bool
 }
 
 // nodeConn holds connection info for a node during deployment.
@@ -71,11 +73,6 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 		}
 	}
 
-	// If a local node exists, require root privileges
-	if localNodeName != "" && os.Geteuid() != 0 {
-		return fmt.Errorf("local node %q requires root privileges; re-run: sudo limguard apply ...", localNodeName)
-	}
-
 	// Connect to all nodes and keep connections open (in parallel)
 	clients := make(map[string]*nodeConn)
 	var clientsMu sync.Mutex
@@ -91,7 +88,7 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 	}()
 
 	log.Info("connecting to nodes")
-	gConnect, _ := errgroup.WithContext(ctx)
+	gConnect, gCtx := errgroup.WithContext(ctx)
 	for name, node := range cfg.Nodes {
 		name, node := name, node // capture loop variables
 
@@ -110,7 +107,7 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 			}
 
 			// Remote node - connect via SSH
-			sshClient, err := sshConnect(node.SSH, opts.SSHKeyPath)
+			sshClient, err := sshConnect(gCtx, node.SSH, opts.SSHKeyPath)
 			if err != nil {
 				return fmt.Errorf("ssh connect to %s: %w", name, err)
 			}
@@ -137,14 +134,18 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 		return err
 	}
 
-	// Determine which platforms need downloading (nodes without localBinaryPath)
+	// Determine which platforms need downloading (remote nodes without localBinaryPath)
 	binaryPaths := make(map[string]string) // key: "os-arch", value: local path
 	var binaryPathsMu sync.Mutex
 	platformsNeedDownload := make(map[string]bool)
 
 	for name, node := range cfg.Nodes {
+		nc := clients[name]
+		// Skip local nodes - they don't need binaries (just WireGuard GUI config)
+		if nc.local {
+			continue
+		}
 		if node.LocalBinaryPath == "" {
-			nc := clients[name]
 			key := fmt.Sprintf("%s-%s", nc.osName, nc.arch)
 			platformsNeedDownload[key] = true
 		}
@@ -208,9 +209,11 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 	}
 
 	// Pass 1: Bootstrap each node (in parallel), handle deletions
+	// Local nodes just generate a key pair locally (no daemon installed).
 	log.Info("pass 1: bootstrapping nodes")
 	publicKeys := make(map[string]string)
 	var pkMu sync.Mutex
+	var localPrivateKey string // Store the private key for local node's WireGuard config
 
 	g, _ := errgroup.WithContext(ctx)
 	for name, node := range cfg.Nodes {
@@ -225,6 +228,39 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 				if err := uninstallNode(nc, name, ifaceName, log); err != nil {
 					return fmt.Errorf("uninstall node %s: %w", name, err)
 				}
+				return nil
+			}
+
+			// Handle local node: just generate keys locally, no daemon deployment
+			if nc.local {
+				log.Info("generating keys for local client", "node", name)
+
+				// Generate/load private key in ~/.limguard/
+				home, err := os.UserHomeDir()
+				if err != nil {
+					return fmt.Errorf("get home directory: %w", err)
+				}
+				keyDir := filepath.Join(home, ".limguard")
+				keyPath := filepath.Join(keyDir, "privatekey")
+
+				privKey, err := EnsurePrivateKey(keyPath)
+				if err != nil {
+					return fmt.Errorf("ensure private key for %s: %w", name, err)
+				}
+				pubKey := privKey.PublicKey().String()
+
+				// Write public key file
+				pubkeyPath := keyPath + ".pub"
+				if err := os.WriteFile(pubkeyPath, []byte(pubKey), 0644); err != nil {
+					return fmt.Errorf("write public key for %s: %w", name, err)
+				}
+
+				pkMu.Lock()
+				publicKeys[name] = pubKey
+				localPrivateKey = privKey.String()
+				pkMu.Unlock()
+
+				log.Info("local client keys ready", "node", name, "publicKey", pubKey)
 				return nil
 			}
 
@@ -246,24 +282,13 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 				return fmt.Errorf("compute source binary hash for %s: %w", name, err)
 			}
 
-			var installedHash string
-			if nc.local {
-				installedHash, _ = fileSHA256(DefaultBinaryPath)
-			} else {
-				installedHash, _ = remoteFileSHA256(nc.ssh, nc.sftp, DefaultBinaryPath)
-			}
+			installedHash, _ := remoteFileSHA256(nc.ssh, nc.sftp, DefaultBinaryPath)
 
 			if srcHash != installedHash {
 				log.Info("copying binary", "node", name, "srcHash", srcHash[:8], "installedHash", installedHash[:min(8, len(installedHash))])
 				tmpBinary := "/tmp/limguard-binary"
-				if nc.local {
-					if err := localCopyFile(srcBinaryPath, tmpBinary); err != nil {
-						return fmt.Errorf("copy binary to %s: %w", name, err)
-					}
-				} else {
-					if err := sftpCopyFile(nc.sftp, srcBinaryPath, tmpBinary); err != nil {
-						return fmt.Errorf("copy binary to %s: %w", name, err)
-					}
+				if err := sftpCopyFile(nc.sftp, srcBinaryPath, tmpBinary); err != nil {
+					return fmt.Errorf("copy binary to %s: %w", name, err)
 				}
 			} else {
 				log.Info("binary unchanged", "node", name, "sha256", srcHash[:8])
@@ -280,14 +305,8 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 			if err != nil {
 				return fmt.Errorf("marshal config for %s: %w", name, err)
 			}
-			if nc.local {
-				if err := os.WriteFile(tmpCfg, cfgData, 0644); err != nil {
-					return fmt.Errorf("write config to %s: %w", name, err)
-				}
-			} else {
-				if err := sftpWriteFile(nc.sftp, tmpCfg, cfgData); err != nil {
-					return fmt.Errorf("write config to %s: %w", name, err)
-				}
+			if err := sftpWriteFile(nc.sftp, tmpCfg, cfgData); err != nil {
+				return fmt.Errorf("write config to %s: %w", name, err)
 			}
 
 			// Run all privileged operations in a single bash session (elevated if needed)
@@ -299,50 +318,31 @@ mv %s %s
 				DefaultBinaryPath, DefaultBinaryPath,
 				tmpCfg, DefaultConfigPath)
 
-			if nc.local {
-				if _, err := localRunAsRoot(setupScript); err != nil {
-					return fmt.Errorf("setup node %s: %w", name, err)
-				}
-			} else {
-				if _, err := runAsRoot(nc.ssh, nc.isRoot, setupScript); err != nil {
-					return fmt.Errorf("setup node %s: %w", name, err)
-				}
+			if _, err := runAsRoot(nc.ssh, nc.isRoot, setupScript); err != nil {
+				return fmt.Errorf("setup node %s: %w", name, err)
 			}
 
 			// Install and start service (runs limguard run, which bootstraps if needed)
 			if nc.osName == "linux" {
-				if err := installLinuxService(nc.ssh, nc.sftp, nc.isRoot, nc.local, name); err != nil {
+				if err := installLinuxService(nc.ssh, nc.sftp, nc.isRoot, name); err != nil {
 					return fmt.Errorf("install linux service on %s: %w", name, err)
 				}
 			} else {
-				if err := installDarwinService(nc.ssh, nc.sftp, nc.isRoot, nc.local, name); err != nil {
+				if err := installDarwinService(nc.ssh, nc.sftp, nc.isRoot, name); err != nil {
 					return fmt.Errorf("install darwin service on %s: %w", name, err)
 				}
 			}
 
 			// Poll for pubkey file (written by limguard run on startup)
 			pubkeyPath := DefaultPrivateKeyPath + ".pub"
-			var pubKey string
-			if nc.local {
-				pubKey, err = waitForLocalPubkey(pubkeyPath, 3*time.Second)
-			} else {
-				pubKey, err = waitForPubkey(nc.ssh, nc.sftp, nc.isRoot, pubkeyPath, 3*time.Second)
-			}
+			pubKey, err := waitForPubkey(nc.ssh, nc.sftp, nc.isRoot, pubkeyPath, 3*time.Second)
 			if err != nil {
 				// Fetch service logs to show what went wrong
 				var serviceLogs string
-				if nc.local {
-					if nc.osName == "linux" {
-						serviceLogs, _ = localRunAsRoot("journalctl -u limguard -n 50 --no-pager 2>&1")
-					} else {
-						serviceLogs, _ = localRunAsRoot("cat /var/log/system.log | grep limguard | tail -50 2>&1")
-					}
+				if nc.osName == "linux" {
+					serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "journalctl -u limguard -n 50 --no-pager 2>&1")
 				} else {
-					if nc.osName == "linux" {
-						serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "journalctl -u limguard -n 50 --no-pager 2>&1")
-					} else {
-						serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "cat /var/log/system.log | grep limguard | tail -50 2>&1")
-					}
+					serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "cat /var/log/system.log | grep limguard | tail -50 2>&1")
 				}
 				return fmt.Errorf("wait for pubkey on %s: %w\nservice logs:\n%s", name, err, serviceLogs)
 			}
@@ -377,6 +377,7 @@ mv %s %s
 	// If service is running, limguard will pick up the config change via file watcher.
 	// If not running, start the service.
 	// Skip nodes marked for deletion (already uninstalled in pass 1).
+	// Skip local nodes (they use WireGuard GUI, no daemon).
 	log.Info("pass 2: distributing full config")
 	cfgYAML, err := cfg.ToYAML()
 	if err != nil {
@@ -389,8 +390,8 @@ mv %s %s
 		node := cfg.Nodes[name]
 		nc := clients[name]
 
-		// Skip deleted nodes
-		if node.IsDelete() {
+		// Skip deleted nodes and local nodes
+		if node.IsDelete() || nc.local {
 			continue
 		}
 
@@ -399,14 +400,8 @@ mv %s %s
 
 			// Write final config
 			tmpCfg := "/tmp/limguard.yaml"
-			if nc.local {
-				if err := os.WriteFile(tmpCfg, cfgYAML, 0644); err != nil {
-					return fmt.Errorf("write final config to %s: %w", name, err)
-				}
-			} else {
-				if err := sftpWriteFile(nc.sftp, tmpCfg, cfgYAML); err != nil {
-					return fmt.Errorf("write final config to %s: %w", name, err)
-				}
+			if err := sftpWriteFile(nc.sftp, tmpCfg, cfgYAML); err != nil {
+				return fmt.Errorf("write final config to %s: %w", name, err)
 			}
 
 			// Move config and restart service to pick up new config
@@ -423,11 +418,7 @@ else
     echo "STARTED"
 fi
 `, tmpCfg, DefaultConfigPath)
-				if nc.local {
-					out, ensureErr = localRunAsRoot(script)
-				} else {
-					out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, script)
-				}
+				out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, script)
 			} else {
 				plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
 				script := fmt.Sprintf(`
@@ -440,11 +431,7 @@ else
     echo "STARTED"
 fi
 `, tmpCfg, DefaultConfigPath, plistPath)
-				if nc.local {
-					out, ensureErr = localRunAsRoot(script)
-				} else {
-					out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, script)
-				}
+				out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, script)
 			}
 			if ensureErr != nil {
 				return fmt.Errorf("update config on %s: %w", name, ensureErr)
@@ -465,7 +452,7 @@ fi
 	}
 
 	// Pass 3: Validate mesh connectivity (in parallel)
-	// Skip nodes marked for deletion.
+	// Skip nodes marked for deletion and local nodes (not connected yet).
 	log.Info("pass 3: validating mesh connectivity")
 
 	// Wait for config to be picked up by file watcher
@@ -475,16 +462,15 @@ fi
 	for name := range cfg.Nodes {
 		name := name // capture loop variable
 		node := cfg.Nodes[name]
+		nc := clients[name]
 
-		// Skip deleted nodes
-		if node.IsDelete() {
+		// Skip deleted nodes and local nodes
+		if node.IsDelete() || nc.local {
 			continue
 		}
 
-		nc := clients[name]
-
 		g3.Go(func() error {
-			// Ping all peers from this node (skip deleted peers)
+			// Ping all remote peers from this node (skip deleted peers and local peers)
 			for peerName, peer := range cfg.Nodes {
 				if peerName == name {
 					continue // skip self
@@ -492,16 +478,14 @@ fi
 				if peer.IsDelete() {
 					continue // skip deleted peers
 				}
+				// Skip local peers - they're not connected yet
+				if isLocalNode(peer) {
+					continue
+				}
 
 				// Ping peer's WireGuard IP
 				pingCmd := fmt.Sprintf("ping -c 3 -W 2 %s", peer.WireguardIP)
-				var out string
-				var err error
-				if nc.local {
-					out, err = localRunAsRoot(pingCmd)
-				} else {
-					out, err = runAsRoot(nc.ssh, nc.isRoot, pingCmd)
-				}
+				out, err := runAsRoot(nc.ssh, nc.isRoot, pingCmd)
 				if err != nil {
 					// Gather debug info on ping failure
 					debugInfo := gatherPingDebugInfo(clients, name, peerName, log)
@@ -522,6 +506,24 @@ fi
 	}
 
 	log.Info("deployment complete - mesh connectivity verified")
+
+	// If there's a local node, write WireGuard config to file for GUI apps
+	if localNodeName != "" && localPrivateKey != "" {
+		localNode := cfg.Nodes[localNodeName]
+		wgConfig := generateWireGuardConfig(cfg, localNodeName, localNode, localPrivateKey)
+
+		// Determine output path (default: <node-name>-peer.conf)
+		wgConfPath := opts.LocalWGConfPath
+		if wgConfPath == "" {
+			wgConfPath = localNodeName + "-peer.conf"
+		}
+
+		if err := os.WriteFile(wgConfPath, []byte(wgConfig), 0600); err != nil {
+			return fmt.Errorf("write WireGuard config: %w", err)
+		}
+		log.Info("WireGuard config written", "path", wgConfPath, "node", localNodeName)
+	}
+
 	return nil
 }
 
@@ -530,6 +532,7 @@ func parseApplyArgs(args []string) (*ApplyOptions, error) {
 	opts := &ApplyOptions{}
 	fs.StringVar(&opts.ConfigPath, "config", "limguard.yaml", "Config file path")
 	fs.StringVar(&opts.SSHKeyPath, "ssh-key", "", "SSH private key path")
+	fs.StringVar(&opts.LocalWGConfPath, "local-wireguard-conf-path", "", "Path to write local node's WireGuard config (default: <node-name>-peer.conf)")
 	fs.BoolVar(&opts.Debug, "debug", false, "Debug logging")
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -539,7 +542,7 @@ func parseApplyArgs(args []string) (*ApplyOptions, error) {
 
 // SSH helpers
 
-func sshConnect(s *SSH, keyPath string) (*ssh.Client, error) {
+func sshConnect(ctx context.Context, s *SSH, keyPath string) (*ssh.Client, error) {
 	var authMethods []ssh.AuthMethod
 	var signers []ssh.Signer
 
@@ -600,7 +603,23 @@ func sshConnect(s *SSH, keyPath string) (*ssh.Client, error) {
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         30 * time.Second,
 	}
-	return ssh.Dial("tcp", net.JoinHostPort(s.Host, fmt.Sprintf("%d", s.Port)), sshCfg)
+
+	// Use context-aware dialer so Ctrl+C works
+	addr := net.JoinHostPort(s.Host, fmt.Sprintf("%d", s.Port))
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+
+	// SSH handshake over the connection
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, sshCfg)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("ssh handshake: %w", err)
+	}
+
+	return ssh.NewClient(sshConn, chans, reqs), nil
 }
 
 // loadPrivateKey reads and parses an SSH private key file.
@@ -690,23 +709,18 @@ func parsePingLatency(output string) string {
 	return "unknown"
 }
 
-// gatherPingDebugInfo collects debug information when a ping fails
+// gatherPingDebugInfo collects debug information when a ping fails between remote nodes.
 func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, log *slog.Logger) string {
 	var sb strings.Builder
 	sb.WriteString("=== DEBUG INFO ===\n")
 
 	// Gather info from source node
-	if nc, ok := clients[srcNode]; ok {
+	if nc, ok := clients[srcNode]; ok && nc.ssh != nil {
 		sb.WriteString(fmt.Sprintf("\n--- %s (source) ---\n", srcNode))
 
 		// WireGuard status (sudo needed on macOS)
 		wgCmd := "wg show 2>&1 || echo '(wg command not found or failed)'"
-		var wgOut string
-		if nc.local {
-			wgOut, _ = localRunAsRoot(wgCmd)
-		} else if nc.ssh != nil {
-			wgOut, _ = runAsRoot(nc.ssh, nc.isRoot, wgCmd)
-		}
+		wgOut, _ := runAsRoot(nc.ssh, nc.isRoot, wgCmd)
 		sb.WriteString("WireGuard status:\n")
 		sb.WriteString(wgOut)
 		sb.WriteString("\n")
@@ -718,12 +732,7 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 		} else {
 			ifCmd = "ifconfig utun0 2>&1 || ifconfig utun1 2>&1 || ifconfig utun2 2>&1 || echo '(no utun interface found)'"
 		}
-		var ifOut string
-		if nc.local {
-			ifOut, _ = localRunAsRoot(ifCmd)
-		} else if nc.ssh != nil {
-			ifOut, _ = runAsRoot(nc.ssh, nc.isRoot, ifCmd)
-		}
+		ifOut, _ := runAsRoot(nc.ssh, nc.isRoot, ifCmd)
 		sb.WriteString("WireGuard interface:\n")
 		sb.WriteString(ifOut)
 		sb.WriteString("\n")
@@ -735,29 +744,19 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 		} else {
 			logsCmd = "cat /var/log/limguard.log 2>&1 | tail -30 || echo '(no log file found)'"
 		}
-		var logsOut string
-		if nc.local {
-			logsOut, _ = localRunAsRoot(logsCmd)
-		} else if nc.ssh != nil {
-			logsOut, _ = runAsRoot(nc.ssh, nc.isRoot, logsCmd)
-		}
+		logsOut, _ := runAsRoot(nc.ssh, nc.isRoot, logsCmd)
 		sb.WriteString("Service logs:\n")
 		sb.WriteString(logsOut)
 		sb.WriteString("\n")
 	}
 
 	// Gather info from destination node
-	if nc, ok := clients[dstNode]; ok {
+	if nc, ok := clients[dstNode]; ok && nc.ssh != nil {
 		sb.WriteString(fmt.Sprintf("\n--- %s (destination) ---\n", dstNode))
 
 		// WireGuard status
 		wgCmd := "wg show 2>&1 || echo '(wg command not found or failed)'"
-		var wgOut string
-		if nc.local {
-			wgOut, _ = localRunAsRoot(wgCmd)
-		} else if nc.ssh != nil {
-			wgOut, _ = runAsRoot(nc.ssh, nc.isRoot, wgCmd)
-		}
+		wgOut, _ := runAsRoot(nc.ssh, nc.isRoot, wgCmd)
 		sb.WriteString("WireGuard status:\n")
 		sb.WriteString(wgOut)
 		sb.WriteString("\n")
@@ -769,12 +768,7 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 		} else {
 			ifCmd = "ifconfig utun0 2>&1 || ifconfig utun1 2>&1 || ifconfig utun2 2>&1 || echo '(no utun interface found)'"
 		}
-		var ifOut string
-		if nc.local {
-			ifOut, _ = localRunAsRoot(ifCmd)
-		} else if nc.ssh != nil {
-			ifOut, _ = runAsRoot(nc.ssh, nc.isRoot, ifCmd)
-		}
+		ifOut, _ := runAsRoot(nc.ssh, nc.isRoot, ifCmd)
 		sb.WriteString("WireGuard interface:\n")
 		sb.WriteString(ifOut)
 		sb.WriteString("\n")
@@ -794,18 +788,6 @@ func waitForPubkey(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, 
 		// Fall back to shell with sudo if needed (file might be root-owned)
 		if out, err := runAsRoot(sshClient, isRoot, fmt.Sprintf("cat %q 2>/dev/null", path)); err == nil && strings.TrimSpace(out) != "" {
 			return strings.TrimSpace(out), nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return "", fmt.Errorf("timeout waiting for %s", path)
-}
-
-// waitForLocalPubkey polls for the pubkey file locally.
-func waitForLocalPubkey(path string, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
-			return strings.TrimSpace(string(data)), nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -923,7 +905,7 @@ func remoteFileSHA256(sshClient *ssh.Client, sftpClient *sftp.Client, path strin
 	return sftpFileSHA256(sftpClient, path)
 }
 
-func installLinuxService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, local bool, nodeName string) error {
+func installLinuxService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, nodeName string) error {
 	service := fmt.Sprintf(`[Unit]
 Description=limguard WireGuard mesh network manager
 After=network-online.target
@@ -952,14 +934,6 @@ WantedBy=multi-user.target
 `, DefaultBinaryPath, DefaultConfigPath, nodeName)
 
 	tmpService := "/tmp/limguard.service"
-	if local {
-		if err := os.WriteFile(tmpService, []byte(service), 0644); err != nil {
-			return fmt.Errorf("write service file: %w", err)
-		}
-		_, err := localRunAsRoot(fmt.Sprintf("mv %s /etc/systemd/system/limguard.service && systemctl daemon-reload && systemctl enable limguard && systemctl restart limguard", tmpService))
-		return err
-	}
-
 	if err := sftpWriteFile(sftpClient, tmpService, []byte(service)); err != nil {
 		return fmt.Errorf("write service file: %w", err)
 	}
@@ -967,7 +941,7 @@ WantedBy=multi-user.target
 	return err
 }
 
-func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, local bool, nodeName string) error {
+func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, nodeName string) error {
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -997,14 +971,6 @@ func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot
 
 	plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
 	tmpPlist := "/tmp/com.limrun.limguard.plist"
-
-	if local {
-		if err := os.WriteFile(tmpPlist, []byte(plist), 0644); err != nil {
-			return fmt.Errorf("write plist file: %w", err)
-		}
-		_, err := localRunAsRoot(fmt.Sprintf("launchctl unload %s 2>/dev/null || true; mv %s %s && launchctl load %s", plistPath, tmpPlist, plistPath, plistPath))
-		return err
-	}
 
 	if err := sftpWriteFile(sftpClient, tmpPlist, []byte(plist)); err != nil {
 		return fmt.Errorf("write plist file: %w", err)
@@ -1083,35 +1049,66 @@ func localRunAsRoot(script string) (string, error) {
 	return stdout.String(), nil
 }
 
-// localCopyFile copies a file from src to dst locally.
-func localCopyFile(src, dst string) error {
-	srcFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer srcFile.Close()
-
-	dstFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer dstFile.Close()
-
-	if _, err := io.Copy(dstFile, srcFile); err != nil {
-		return err
-	}
-
-	// Preserve executable permission
-	srcStat, err := srcFile.Stat()
-	if err != nil {
-		return err
-	}
-	return os.Chmod(dst, srcStat.Mode())
-}
-
 // localDetectPlatform returns the OS and architecture of the local machine.
 func localDetectPlatform() (string, string) {
 	osName := runtime.GOOS
 	arch := runtime.GOARCH
 	return osName, arch
+}
+
+// wgConfigTemplate is the WireGuard INI config template for GUI apps.
+var wgConfigTemplate = template.Must(template.New("wgconfig").Parse(`[Interface]
+PrivateKey = {{.PrivateKey}}
+Address = {{.Address}}/24
+{{range .Peers}}
+[Peer]
+PublicKey = {{.PublicKey}}
+AllowedIPs = {{.WireguardIP}}/32
+{{- if .Endpoint}}
+Endpoint = {{.Endpoint}}
+{{- end}}
+PersistentKeepalive = 25
+{{end}}`))
+
+// wgConfigData holds data for the WireGuard config template.
+type wgConfigData struct {
+	PrivateKey string
+	Address    string
+	Peers      []wgPeerData
+}
+
+// wgPeerData holds data for a single peer in the WireGuard config.
+type wgPeerData struct {
+	PublicKey   string
+	WireguardIP string
+	Endpoint    string
+}
+
+// generateWireGuardConfig creates a WireGuard INI config file for GUI apps.
+func generateWireGuardConfig(cfg *Config, localNodeName string, localNode Node, privateKey string) string {
+	// Build peer list
+	var peers []wgPeerData
+	for name, node := range cfg.Nodes {
+		// Skip self, deleted nodes, and nodes without public keys
+		if name == localNodeName || node.IsDelete() || node.PublicKey == "" {
+			continue
+		}
+		peers = append(peers, wgPeerData{
+			PublicKey:   node.PublicKey,
+			WireguardIP: node.WireguardIP,
+			Endpoint:    node.Endpoint,
+		})
+	}
+
+	data := wgConfigData{
+		PrivateKey: privateKey,
+		Address:    localNode.WireguardIP,
+		Peers:      peers,
+	}
+
+	var buf bytes.Buffer
+	if err := wgConfigTemplate.Execute(&buf, data); err != nil {
+		return fmt.Sprintf("error generating config: %v", err)
+	}
+	return buf.String()
 }

@@ -33,9 +33,11 @@ nodes:
     #     ssh:
     #         host: 192.168.104.99
     #
-    # Example local node (uncomment to join mesh from this machine):
+    # Example local node for WireGuard GUI apps (no daemon installed):
+    # This generates a WireGuard config that you can import into the WireGuard
+    # GUI app on macOS, Windows, iOS, or Android. No endpoint needed since
+    # the client initiates connections to peers.
     # ops-laptop:
     #     wireguardIP: 10.200.0.50
-    #     interfaceName: utun9          # Optional: override interface name
     #     ssh:
-    #         host: self                # Special value: configure locally, no SSH
+    #         host: self                # Special value: generate WireGuard config, no daemon
