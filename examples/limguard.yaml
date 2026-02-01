@@ -9,7 +9,7 @@ nodes:
         endpoint: 192.168.104.1
         ssh:
             host: 127.0.0.1
-            port: 55743
+            port: 56614
             user: muvaf
             identityFile: ~/.ssh/id_ed25519
     node-2:
@@ -17,14 +17,6 @@ nodes:
         endpoint: 192.168.104.3
         ssh:
             host: 127.0.0.1
-            port: 55764
-            user: muvaf
-            identityFile: ~/.ssh/id_ed25519
-    node-3:
-        wireguardIP: 10.200.0.3
-        endpoint: 192.168.104.4
-        ssh:
-            host: 127.0.0.1
-            port: 55928
+            port: 56641
             user: muvaf
             identityFile: ~/.ssh/id_ed25519

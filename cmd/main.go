@@ -23,6 +23,7 @@ import (
 	"github.com/limrun-inc/limguard"
 	"github.com/limrun-inc/limguard/config"
 	"github.com/limrun-inc/limguard/version"
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -251,21 +252,51 @@ func cmdApply(args []string) {
 		os.Exit(1)
 	}
 
+	// Connect to all nodes and keep connections open
+	type nodeConn struct {
+		ssh    *ssh.Client
+		sftp   *sftp.Client
+		osName string
+		arch   string
+		isRoot bool
+	}
+	clients := make(map[string]*nodeConn)
+	defer func() {
+		for _, nc := range clients {
+			nc.sftp.Close()
+			nc.ssh.Close()
+		}
+	}()
+
+	log.Info("connecting to nodes")
+	for name, node := range cfg.Nodes {
+		sshClient, err := sshConnect(node.SSH, *sshKey)
+		if err != nil {
+			log.Error("ssh connect", "node", name, "error", err)
+			os.Exit(1)
+		}
+		sftpClient, err := sftp.NewClient(sshClient)
+		if err != nil {
+			log.Error("sftp connect", "node", name, "error", err)
+			os.Exit(1)
+		}
+		osName, arch := detectPlatform(sshClient)
+		// Check if already root (uid 0)
+		uidOut, _ := sshRun(sshClient, "id -u")
+		isRoot := strings.TrimSpace(uidOut) == "0"
+		clients[name] = &nodeConn{ssh: sshClient, sftp: sftpClient, osName: osName, arch: arch, isRoot: isRoot}
+		log.Info("connected", "node", name, "os", osName, "arch", arch, "root", isRoot)
+	}
+
 	// Pass 1: Bootstrap each node
 	log.Info("pass 1: bootstrapping nodes")
 	publicKeys := make(map[string]string)
 
 	for name, node := range cfg.Nodes {
-		log.Info("bootstrapping", "node", name, "host", node.SSH.Host)
+		nc := clients[name]
+		log.Info("bootstrapping", "node", name)
 
-		client, err := sshConnect(node.SSH, *sshKey)
-		if err != nil {
-			log.Error("ssh connect", "node", name, "error", err)
-			os.Exit(1)
-		}
-
-		osName, arch := detectPlatform(client)
-		binaryName := fmt.Sprintf("limguard-%s-%s", osName, arch)
+		binaryName := fmt.Sprintf("limguard-%s-%s", nc.osName, nc.arch)
 		localBinaryPath := filepath.Join(cfg.ArtifactDir, binaryName)
 
 		// Check if binary needs to be copied (compare SHA256 hashes)
@@ -274,29 +305,19 @@ func cmdApply(args []string) {
 			log.Error("compute local binary hash", "node", name, "error", err)
 			os.Exit(1)
 		}
-		remoteHash, _ := sshRun(client, fmt.Sprintf("sha256sum %s 2>/dev/null | cut -d' ' -f1", cfg.BinaryPath))
-		remoteHash = strings.TrimSpace(remoteHash)
+		remoteHash, _ := remoteFileSHA256(nc.ssh, nc.sftp, cfg.BinaryPath)
 
 		if localHash != remoteHash {
 			log.Info("copying binary", "node", name, "localHash", localHash[:8], "remoteHash", remoteHash[:min(8, len(remoteHash))])
-			// Copy binary (write to temp, then sudo mv to final location)
+			// Copy binary to temp location via SFTP
 			tmpBinary := "/tmp/limguard-binary"
-			if err := scpFile(client, localBinaryPath, tmpBinary, 0755); err != nil {
+			if err := sftpCopyFile(nc.sftp, localBinaryPath, tmpBinary); err != nil {
 				log.Error("copy binary", "node", name, "error", err)
-				os.Exit(1)
-			}
-			if _, err := sshRun(client, fmt.Sprintf("sudo mv %s %s && sudo chmod 755 %s", tmpBinary, cfg.BinaryPath, cfg.BinaryPath)); err != nil {
-				log.Error("install binary", "node", name, "error", err)
 				os.Exit(1)
 			}
 		} else {
 			log.Info("binary unchanged", "node", name, "sha256", localHash[:8])
 		}
-
-		// Create directories (with sudo for system paths)
-		sshRun(client, fmt.Sprintf("sudo mkdir -p %s %s",
-			filepath.Dir(config.DefaultConfigPath),
-			filepath.Dir(cfg.PrivateKeyPath)))
 
 		// Write minimal config for this node (empty publicKey to skip validation during bootstrap)
 		minCfg := &config.Config{
@@ -306,34 +327,48 @@ func cmdApply(args []string) {
 			Nodes:          map[string]config.Node{name: {WireguardIP: node.WireguardIP, Endpoint: node.Endpoint, PublicKey: ""}},
 		}
 		tmpCfg := "/tmp/limguard-bootstrap.yaml"
-		writeRemoteFile(client, tmpCfg, mustMarshal(minCfg))
-		sshRun(client, fmt.Sprintf("sudo mv %s %s", tmpCfg, config.DefaultConfigPath))
+		if err := sftpWriteFile(nc.sftp, tmpCfg, mustMarshal(minCfg)); err != nil {
+			log.Error("write config", "node", name, "error", err)
+			os.Exit(1)
+		}
+
+		// Run all privileged operations in a single bash session (elevated if needed)
+		setupScript := fmt.Sprintf(`
+mkdir -p %s %s
+if [ -f /tmp/limguard-binary ]; then mv /tmp/limguard-binary %s && chmod 755 %s; fi
+mv %s %s
+`, filepath.Dir(config.DefaultConfigPath), filepath.Dir(cfg.PrivateKeyPath),
+			cfg.BinaryPath, cfg.BinaryPath,
+			tmpCfg, config.DefaultConfigPath)
+
+		if _, err := runAsRoot(nc.ssh, nc.isRoot, setupScript); err != nil {
+			log.Error("setup node", "node", name, "error", err)
+			os.Exit(1)
+		}
 
 		// Install and start service (runs limguard run, which bootstraps if needed)
-		if osName == "linux" {
-			installLinuxService(client, cfg, name)
+		if nc.osName == "linux" {
+			installLinuxService(nc.ssh, nc.sftp, nc.isRoot, cfg, name)
 		} else {
-			installDarwinService(client, cfg, name)
+			installDarwinService(nc.ssh, nc.sftp, nc.isRoot, cfg, name)
 		}
 
 		// Poll for pubkey file (written by limguard run on startup)
 		pubkeyPath := cfg.PrivateKeyPath + ".pub"
-		pubKey, err := waitForPubkey(client, pubkeyPath, 3*time.Second)
+		pubKey, err := waitForPubkey(nc.ssh, nc.sftp, nc.isRoot, pubkeyPath, 3*time.Second)
 		if err != nil {
 			// Fetch service logs to show what went wrong
 			var serviceLogs string
-			if osName == "linux" {
-				serviceLogs, _ = sshRun(client, "sudo journalctl -u limguard -n 50 --no-pager 2>&1")
+			if nc.osName == "linux" {
+				serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "journalctl -u limguard -n 50 --no-pager 2>&1")
 			} else {
-				serviceLogs, _ = sshRun(client, "sudo cat /var/log/system.log | grep limguard | tail -50 2>&1")
+				serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "cat /var/log/system.log | grep limguard | tail -50 2>&1")
 			}
 			log.Error("wait for pubkey", "node", name, "error", err, "serviceLogs", serviceLogs)
 			os.Exit(1)
 		}
 		publicKeys[name] = pubKey
 		log.Info("bootstrapped", "node", name, "publicKey", truncateKey(pubKey))
-
-		client.Close()
 	}
 
 	// Update config with public keys
@@ -350,35 +385,30 @@ func cmdApply(args []string) {
 	}
 	log.Info("updated local config with public keys")
 
-	// Pass 2: Distribute full config and restart services
+	// Pass 2: Distribute full config and restart services (reuse connections)
 	log.Info("pass 2: distributing full config")
 	cfgYAML := mustMarshal(cfg)
 
-	for name, node := range cfg.Nodes {
+	for name := range cfg.Nodes {
+		nc := clients[name]
 		log.Info("updating config", "node", name)
 
-		client, err := sshConnect(node.SSH, *sshKey)
-		if err != nil {
-			log.Error("ssh connect", "node", name, "error", err)
+		// Write final config via SFTP
+		tmpCfg := "/tmp/limguard.yaml"
+		if err := sftpWriteFile(nc.sftp, tmpCfg, cfgYAML); err != nil {
+			log.Error("write config", "node", name, "error", err)
 			os.Exit(1)
 		}
 
-		osName, _ := detectPlatform(client)
-
-		// Write final config
-		tmpCfg := "/tmp/limguard.yaml"
-		writeRemoteFile(client, tmpCfg, cfgYAML)
-		sshRun(client, fmt.Sprintf("sudo mv %s %s", tmpCfg, config.DefaultConfigPath))
-
-		// Restart service to pick up new config (mv replaces inode, fsnotify may miss it)
-		if osName == "linux" {
-			sshRun(client, "sudo systemctl restart limguard")
+		// Move config and restart service in single elevated session
+		if nc.osName == "linux" {
+			runAsRoot(nc.ssh, nc.isRoot, fmt.Sprintf("mv %s %s && systemctl restart limguard", tmpCfg, config.DefaultConfigPath))
 		} else {
 			plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
-			sshRun(client, fmt.Sprintf("sudo launchctl unload %s && sudo launchctl load %s", plistPath, plistPath))
+			runAsRoot(nc.ssh, nc.isRoot, fmt.Sprintf("mv %s %s && launchctl unload %s && launchctl load %s",
+				tmpCfg, config.DefaultConfigPath, plistPath, plistPath))
 		}
 
-		client.Close()
 		log.Info("configured", "node", name)
 	}
 
@@ -459,15 +489,29 @@ func sshRun(client *ssh.Client, cmd string) (string, error) {
 	return stdout.String(), nil
 }
 
-func waitForPubkey(client *ssh.Client, path string, timeout time.Duration) (string, error) {
+func waitForPubkey(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, path string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if out, err := sshRun(client, fmt.Sprintf("cat %s 2>/dev/null", path)); err == nil && strings.TrimSpace(out) != "" {
+		// Try SFTP first (works if file is readable by ssh user)
+		if data, err := sftpReadFile(sftpClient, path); err == nil && len(data) > 0 {
+			return strings.TrimSpace(string(data)), nil
+		}
+		// Fall back to shell with sudo if needed (file might be root-owned)
+		if out, err := runAsRoot(sshClient, isRoot, fmt.Sprintf("cat %s 2>/dev/null", path)); err == nil && strings.TrimSpace(out) != "" {
 			return strings.TrimSpace(out), nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	return "", fmt.Errorf("timeout waiting for %s", path)
+}
+
+// runAsRoot runs a shell script as root. If already root, runs directly.
+// If not root, uses sudo to elevate privileges.
+func runAsRoot(client *ssh.Client, isRoot bool, script string) (string, error) {
+	if isRoot {
+		return sshRun(client, fmt.Sprintf("sh -c '%s'", script))
+	}
+	return sshRun(client, fmt.Sprintf("sudo sh -c '%s'", script))
 }
 
 func detectPlatform(client *ssh.Client) (string, string) {
@@ -493,33 +537,77 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(hash[:]), nil
 }
 
-func writeRemoteFile(client *ssh.Client, path string, data []byte) error {
-	sess, err := client.NewSession()
+// SFTP file operations
+
+func sftpWriteFile(client *sftp.Client, path string, data []byte) error {
+	f, err := client.Create(path)
 	if err != nil {
 		return err
 	}
-	defer sess.Close()
-	go func() {
-		stdin, _ := sess.StdinPipe()
-		io.Copy(stdin, bytes.NewReader(data))
-		stdin.Close()
-	}()
-	return sess.Run(fmt.Sprintf("cat > %s", path))
+	defer f.Close()
+	_, err = f.Write(data)
+	return err
 }
 
-func scpFile(client *ssh.Client, localPath, remotePath string, mode os.FileMode) error {
-	data, err := os.ReadFile(localPath)
+func sftpReadFile(client *sftp.Client, path string) ([]byte, error) {
+	f, err := client.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+func sftpCopyFile(client *sftp.Client, localPath, remotePath string) error {
+	local, err := os.Open(localPath)
 	if err != nil {
 		return err
 	}
-	if err := writeRemoteFile(client, remotePath, data); err != nil {
+	defer local.Close()
+
+	remote, err := client.Create(remotePath)
+	if err != nil {
 		return err
 	}
-	sshRun(client, fmt.Sprintf("chmod %o %s", mode, remotePath))
-	return nil
+	defer remote.Close()
+
+	_, err = io.Copy(remote, local)
+	if err != nil {
+		return err
+	}
+
+	// Preserve executable permission
+	localStat, err := local.Stat()
+	if err != nil {
+		return err
+	}
+	return client.Chmod(remotePath, localStat.Mode())
 }
 
-func installLinuxService(client *ssh.Client, cfg *config.Config, nodeName string) {
+func sftpFileSHA256(client *sftp.Client, path string) (string, error) {
+	data, err := sftpReadFile(client, path)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:]), nil
+}
+
+// remoteFileSHA256 computes SHA256 of a remote file.
+// Tries sha256sum command first (faster, no download), falls back to SFTP.
+func remoteFileSHA256(sshClient *ssh.Client, sftpClient *sftp.Client, path string) (string, error) {
+	// Try sha256sum command first (available on most Linux systems, some macOS)
+	if out, err := sshRun(sshClient, fmt.Sprintf("sha256sum '%s' 2>/dev/null | cut -d' ' -f1", path)); err == nil {
+		hash := strings.TrimSpace(out)
+		if len(hash) == 64 { // valid SHA256 hex string
+			return hash, nil
+		}
+	}
+	// Fall back to SFTP (download and hash locally)
+	return sftpFileSHA256(sftpClient, path)
+}
+
+func installLinuxService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, cfg *config.Config, nodeName string) {
 	service := fmt.Sprintf(`[Unit]
 Description=limguard WireGuard mesh network manager
 After=network-online.target
@@ -548,14 +636,11 @@ WantedBy=multi-user.target
 `, cfg.BinaryPath, config.DefaultConfigPath, nodeName)
 
 	tmpService := "/tmp/limguard.service"
-	writeRemoteFile(client, tmpService, []byte(service))
-	sshRun(client, fmt.Sprintf("sudo mv %s /etc/systemd/system/limguard.service", tmpService))
-	sshRun(client, "sudo systemctl daemon-reload")
-	sshRun(client, "sudo systemctl enable limguard")
-	sshRun(client, "sudo systemctl restart limguard")
+	sftpWriteFile(sftpClient, tmpService, []byte(service))
+	runAsRoot(sshClient, isRoot, fmt.Sprintf("mv %s /etc/systemd/system/limguard.service && systemctl daemon-reload && systemctl enable limguard && systemctl restart limguard", tmpService))
 }
 
-func installDarwinService(client *ssh.Client, cfg *config.Config, nodeName string) {
+func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, cfg *config.Config, nodeName string) {
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -581,10 +666,8 @@ func installDarwinService(client *ssh.Client, cfg *config.Config, nodeName strin
 
 	plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
 	tmpPlist := "/tmp/com.limrun.limguard.plist"
-	sshRun(client, fmt.Sprintf("sudo launchctl unload %s 2>/dev/null || true", plistPath))
-	writeRemoteFile(client, tmpPlist, []byte(plist))
-	sshRun(client, fmt.Sprintf("sudo mv %s %s", tmpPlist, plistPath))
-	sshRun(client, fmt.Sprintf("sudo launchctl load %s", plistPath))
+	sftpWriteFile(sftpClient, tmpPlist, []byte(plist))
+	runAsRoot(sshClient, isRoot, fmt.Sprintf("launchctl unload %s 2>/dev/null || true; mv %s %s && launchctl load %s", plistPath, tmpPlist, plistPath, plistPath))
 }
 
 func mustMarshal(cfg *config.Config) []byte {

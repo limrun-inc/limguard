@@ -26,36 +26,31 @@ limactl start node-2
 
 ## 2. Get VM Information
 
-Get the SSH port (Lima uses port forwarding to localhost):
+Get the endpoint and SSH information to use in config file:
 
 ```bash
 # Get SSH connection info for each VM
 # Look for the -o Port=XXXXX in the output
-limactl show-ssh node-1 2>/dev/null | grep -o 'Port=[0-9]*' | cut -d= -f2
-limactl show-ssh node-2 2>/dev/null | grep -o 'Port=[0-9]*' | cut -d= -f2
-```
+echo "SSH information for node-1:"
+echo "127.0.0.1:$(limactl show-ssh node-1 2>/dev/null | grep -o 'Port=[0-9]*' | cut -d= -f2)"
+echo "Endpoint for node-1: $(limactl shell node-1 -- ip addr show eth0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)"
 
-Get the VM IPs (for WireGuard endpoints - VM-to-VM communication):
+echo "SSH information for node-2:"
+echo "127.0.0.1:$(limactl show-ssh node-2 2>/dev/null | grep -o 'Port=[0-9]*' | cut -d= -f2)"
 
-```bash
-limactl shell node-1 -- ip addr show eth0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1
-limactl shell node-2 -- ip addr show eth0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1
+echo "Endpoing for node-2: $(limactl shell node-2 -- ip addr show eth0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)"
 ```
 
 Note both the SSH ports and VM IPs.
 
 ## 3. Enable SSH Access
 
-Copy your SSH key to each VM and enable passwordless sudo:
+Copy your SSH key to each VM:
 
 ```bash
 # Copy SSH keys
 limactl shell node-1 -- bash -c "mkdir -p ~/.ssh && echo '$(cat ~/.ssh/id_ed25519.pub)' >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
 limactl shell node-2 -- bash -c "mkdir -p ~/.ssh && echo '$(cat ~/.ssh/id_ed25519.pub)' >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
-
-# Enable passwordless sudo
-limactl shell node-1 -- sudo bash -c 'echo "$(whoami) ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/lima-user'
-limactl shell node-2 -- sudo bash -c 'echo "$(whoami) ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/lima-user'
 ```
 
 ## 4. Build limguard Binaries
@@ -118,12 +113,6 @@ go run ./cmd/main.go apply --config test-limguard.yaml
 ## 7. Verify the Mesh
 
 ```bash
-# Check WireGuard interface on node-1
-limactl shell node-1 -- sudo wg show
-
-# Check WireGuard interface on node-2
-limactl shell node-2 -- sudo wg show
-
 # Ping node-2 from node-1 via WireGuard tunnel
 limactl shell node-1 -- ping -c 3 10.200.0.2
 
@@ -135,8 +124,8 @@ limactl shell node-2 -- ping -c 3 10.200.0.1
 
 ```bash
 # Check limguard service status
-limactl shell node-1 -- sudo systemctl status limguard
-limactl shell node-2 -- sudo systemctl status limguard
+limactl shell node-1 -- sudo systemctl status limguard --no-pager
+limactl shell node-2 -- sudo systemctl status limguard --no-pager
 
 # View logs
 limactl shell node-1 -- sudo journalctl -u limguard -n 20 --no-pager
@@ -146,8 +135,10 @@ limactl shell node-1 -- sudo journalctl -u limguard -n 20 --no-pager
 
 ```bash
 # Stop and delete VMs
-limactl stop node-1 node-2
-limactl delete node-1 node-2
+limactl stop node-1
+limactl stop node-2
+limactl delete node-1
+limactl delete node-2
 
 # Remove test config
 rm test-limguard.yaml
