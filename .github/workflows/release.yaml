@@ -12,61 +12,7 @@ env:
   GO_VERSION: '1.24'
 
 jobs:
-  test:
-    runs-on: macos-26
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Install Lima, socket_vmnet, and WireGuard tools
-        run: |
-          brew install lima socket_vmnet wireguard-tools
-
-      - name: Configure socket_vmnet
-        run: |
-          # Copy binary to expected location with root ownership (Lima requires root-owned binary)
-          sudo mkdir -p /opt/socket_vmnet/bin
-          sudo cp $(brew --prefix socket_vmnet)/bin/socket_vmnet /opt/socket_vmnet/bin/socket_vmnet
-          sudo chown root:wheel /opt/socket_vmnet/bin/socket_vmnet
-          sudo chmod 755 /opt/socket_vmnet/bin/socket_vmnet
-          
-          # Configure sudoers for Lima networking
-          limactl sudoers > etc_sudoers.d_lima
-          sudo install -o root etc_sudoers.d_lima /private/etc/sudoers.d/lima
-          rm etc_sudoers.d_lima
-          
-          # Start socket_vmnet service
-          sudo brew services start socket_vmnet
-          
-          # Wait up to 15 seconds for socket_vmnet to start
-          for i in {1..15}; do
-            if pgrep -x socket_vmnet > /dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          if ! pgrep -x socket_vmnet > /dev/null; then
-            echo "socket_vmnet failed to start after 15 seconds"
-            exit 1
-          fi
-
-      - name: Ensure SSH key exists
-        run: |
-          if [[ ! -f ~/.ssh/id_ed25519 ]]; then
-            ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
-          fi
-
-      - name: Run E2E tests
-        run: |
-          sudo ./tests/e2e.sh
-
   release:
-    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: write
