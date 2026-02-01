@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -16,19 +17,17 @@ import (
 
 // Default configuration values.
 const (
-	DefaultListenPort     = 51820
 	DefaultPrivateKeyPath = "/etc/limguard/privatekey"
 	DefaultConfigPath     = "/etc/limguard/limguard.yaml"
 	DefaultBinaryPath     = "/usr/local/bin/limguard"
 )
 
-// DefaultInterfaceName returns the default WireGuard interface name for the current platform.
-func DefaultInterfaceName() string {
-	if runtime.GOOS == "darwin" {
-		return "utun5"
-	}
-	return "wg0"
-}
+// DefaultLinuxInterfaceName is the default WireGuard interface name on Linux.
+const DefaultLinuxInterfaceName = "wg0"
+
+// DefaultDarwinInterfaceName is the default WireGuard interface name on macOS.
+// Must be a specific utun interface (e.g., utun9).
+const DefaultDarwinInterfaceName = "utun9"
 
 // SSH holds SSH connection details for a node (used only by deploy command).
 type SSH struct {
@@ -40,21 +39,22 @@ type SSH struct {
 
 // Node represents a node in the WireGuard mesh.
 type Node struct {
-	WireguardIP string `yaml:"wireguardIP"`
-	Endpoint    string `yaml:"endpoint"`
-	PublicKey   string `yaml:"publicKey,omitempty"` // Filled in after bootstrap
-	SSH         *SSH   `yaml:"ssh,omitempty"`       // Used only by deploy command
+	WireguardIP   string `yaml:"wireguardIP"`
+	Endpoint      string `yaml:"endpoint"`               // Must be host:port format
+	PublicKey     string `yaml:"publicKey,omitempty"`     // Filled in after bootstrap
+	InterfaceName string `yaml:"interfaceName,omitempty"` // Per-node override
+	SSH           *SSH   `yaml:"ssh,omitempty"`           // Used only by deploy command
 }
 
 // Config is the unified configuration for limguard.
 // The same file is used for deployment and runtime on all nodes.
 type Config struct {
-	InterfaceName  string          `yaml:"interfaceName,omitempty"`
-	ListenPort     int             `yaml:"listenPort,omitempty"`
-	PrivateKeyPath string          `yaml:"privateKeyPath,omitempty"`
-	BinaryPath     string          `yaml:"binaryPath,omitempty"`  // Used by deploy
-	ArtifactDir    string          `yaml:"artifactDir,omitempty"` // Used by deploy (local binaries)
-	Nodes          map[string]Node `yaml:"nodes"`
+	LinuxInterfaceName  string          `yaml:"linuxInterfaceName,omitempty"`  // Default for Linux nodes
+	DarwinInterfaceName string          `yaml:"darwinInterfaceName,omitempty"` // Default for macOS nodes
+	PrivateKeyPath      string          `yaml:"privateKeyPath,omitempty"`
+	BinaryPath          string          `yaml:"binaryPath,omitempty"`  // Used by deploy
+	ArtifactDir         string          `yaml:"artifactDir,omitempty"` // Used by deploy (local binaries)
+	Nodes               map[string]Node `yaml:"nodes"`
 }
 
 // LoadConfig reads and parses a config file.
@@ -72,11 +72,11 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
-	if c.InterfaceName == "" {
-		c.InterfaceName = DefaultInterfaceName()
+	if c.LinuxInterfaceName == "" {
+		c.LinuxInterfaceName = DefaultLinuxInterfaceName
 	}
-	if c.ListenPort == 0 {
-		c.ListenPort = DefaultListenPort
+	if c.DarwinInterfaceName == "" {
+		c.DarwinInterfaceName = DefaultDarwinInterfaceName
 	}
 	if c.PrivateKeyPath == "" {
 		c.PrivateKeyPath = DefaultPrivateKeyPath
@@ -95,6 +95,35 @@ func (c *Config) applyDefaults() {
 			c.Nodes[name] = node
 		}
 	}
+}
+
+// InterfaceName returns the WireGuard interface name for a node on the current platform.
+// If the node has a per-node override, that is used. Otherwise, the platform default is used.
+func (c *Config) InterfaceName(nodeName string) string {
+	if node, ok := c.Nodes[nodeName]; ok && node.InterfaceName != "" {
+		return node.InterfaceName
+	}
+	if runtime.GOOS == "darwin" {
+		return c.DarwinInterfaceName
+	}
+	return c.LinuxInterfaceName
+}
+
+// NodeListenPort parses and returns the WireGuard listen port from a node's endpoint.
+func (c *Config) NodeListenPort(nodeName string) (int, error) {
+	node, ok := c.Nodes[nodeName]
+	if !ok {
+		return 0, fmt.Errorf("node %q not found", nodeName)
+	}
+	_, portStr, err := net.SplitHostPort(node.Endpoint)
+	if err != nil {
+		return 0, fmt.Errorf("invalid endpoint %q: must be host:port format", node.Endpoint)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid port in endpoint %q: %w", node.Endpoint, err)
+	}
+	return port, nil
 }
 
 // Validate checks the config for runtime use.
@@ -117,6 +146,10 @@ func (c *Config) Validate() error {
 		seenIPs[node.WireguardIP] = name
 		if node.Endpoint == "" {
 			return fmt.Errorf("node %q: endpoint required", name)
+		}
+		// Validate endpoint is host:port format
+		if _, _, err := net.SplitHostPort(node.Endpoint); err != nil {
+			return fmt.Errorf("node %q: endpoint must be host:port format (got %q)", name, node.Endpoint)
 		}
 		// Skip publicKey validation if empty (bootstrap mode for self node)
 		// Non-empty publicKeys must be valid
@@ -162,16 +195,9 @@ func (c *Config) GetPeers(selfName string) map[string]Node {
 	return peers
 }
 
-// EndpointWithPort returns endpoint with port appended if not present.
-// Handles both IPv4 and IPv6 addresses correctly.
-func (c *Config) EndpointWithPort(endpoint string) string {
-	// Try to split as host:port first
-	if _, _, err := net.SplitHostPort(endpoint); err == nil {
-		// Already has port
-		return endpoint
-	}
-	// No port, add default
-	return net.JoinHostPort(endpoint, fmt.Sprintf("%d", c.ListenPort))
+// PeerEndpoint returns the endpoint (host:port) for a peer node.
+func (c *Config) PeerEndpoint(peerName string) string {
+	return c.Nodes[peerName].Endpoint
 }
 
 // Save writes the config back to the given path.

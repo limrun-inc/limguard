@@ -3,7 +3,6 @@ module github.com/limrun-inc/limguard
 go 1.24.0
 
 require (
-	github.com/fsnotify/fsnotify v1.9.0
 	github.com/pkg/sftp v1.13.10
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/crypto v0.45.0

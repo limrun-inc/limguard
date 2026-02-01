@@ -1,4 +1,4 @@
-# Testing limguard with Lima VMs
+# Testing limguard
 
 This guide covers testing limguard using Lima VMs on macOS.
 
@@ -6,7 +6,85 @@ This guide covers testing limguard using Lima VMs on macOS.
 
 - Go 1.21+
 - Lima (`brew install lima`)
+- socket_vmnet for shared networking (see [tests/README.md](tests/README.md) for full setup)
 - SSH key pair (`~/.ssh/id_ed25519` or `~/.ssh/id_rsa`)
+
+## Integration Tests
+
+### Basic Integration Test (Two VMs)
+
+Deploys limguard to two Lima VMs and verifies mesh connectivity:
+
+```bash
+./tests/integration.sh
+```
+
+The test will:
+1. Create two Lima VMs (`limguard-test-1`, `limguard-test-2`)
+2. Build and deploy limguard to both VMs
+3. Verify mesh connectivity between VMs
+4. Clean up VMs
+
+To keep VMs for debugging:
+
+```bash
+CLEANUP=0 ./tests/integration.sh
+```
+
+### Integration Test with Local Node
+
+Deploys limguard to two Lima VMs **plus your local machine**:
+
+```bash
+sudo ./tests/integration-local.sh
+```
+
+**Note:** This test requires root because it installs limguard as a service on your machine.
+
+The test will:
+1. Create two Lima VMs
+2. Build binaries for Linux (VMs) and your local OS
+3. Deploy limguard to VMs and local machine (using `ssh.host: self`)
+4. Verify full mesh connectivity (VMs ↔ VMs ↔ local)
+5. Clean up VMs and local service
+
+To keep everything for debugging:
+
+```bash
+CLEANUP=0 sudo ./tests/integration-local.sh
+```
+
+### Manual Cleanup
+
+If you used `CLEANUP=0` or the test failed, clean up manually:
+
+```bash
+# VMs
+limactl stop limguard-test-1 limguard-test-2
+limactl delete limguard-test-1 limguard-test-2
+
+# Local service (macOS)
+sudo launchctl unload /Library/LaunchDaemons/com.limrun.limguard.plist
+sudo rm /Library/LaunchDaemons/com.limrun.limguard.plist
+sudo rm -rf /etc/limguard
+
+# Local service (Linux)
+sudo systemctl stop limguard
+sudo systemctl disable limguard
+sudo rm /etc/systemd/system/limguard.service
+sudo systemctl daemon-reload
+sudo rm -rf /etc/limguard
+```
+
+### Unit Tests
+
+Run unit tests (no VMs required):
+
+```bash
+go test -v ./...
+```
+
+## Manual Testing
 
 ### 1. Create Lima VMs
 
@@ -133,8 +211,6 @@ limactl shell node-1 -- sudo journalctl -u limguard -n 20 --no-pager
 
 ### 9. Cleanup
 
-For manual test VMs:
-
 ```bash
 # Stop and delete VMs
 limactl stop node-1
@@ -144,13 +220,6 @@ limactl delete node-2
 
 # Remove test config
 rm test-limguard.yaml
-```
-
-For integration test VMs (if `LIMGUARD_TEST_NO_CLEANUP=1` was used):
-
-```bash
-limactl stop limguard-test-1 limguard-test-2
-limactl delete limguard-test-1 limguard-test-2
 ```
 
 ## Troubleshooting

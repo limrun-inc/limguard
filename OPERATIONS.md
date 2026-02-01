@@ -91,16 +91,52 @@ sudo launchctl load /Library/LaunchDaemons/com.limrun.limguard.plist
          user: root
    ```
 
-2. Run deploy:
+2. Run apply:
    ```bash
-   limguard deploy --config limguard.yaml
+   limguard apply --config limguard.yaml
    ```
+
+## Joining the Mesh Locally
+
+To temporarily join the mesh from your local machine (e.g., for operations or debugging):
+
+1. Add a local node to your config with `ssh.host: self`:
+   ```yaml
+   nodes:
+     ops-laptop:
+       wireguardIP: "10.200.0.50"
+       endpoint: "your.public.ip"
+       ssh:
+         host: self    # Special value: configure locally, no SSH
+   ```
+
+2. Run apply with root privileges:
+   ```bash
+   sudo limguard apply --config limguard.yaml
+   ```
+
+This will:
+- Install the binary and config locally
+- Start the limguard service on the local machine
+- Add the local node as a peer on all other nodes
+
+**Note:** Only one local node (`ssh.host: self`) is allowed per config.
 
 ## Removing a Node
 
 1. Remove from `limguard.yaml`
-2. Copy updated config to all remaining nodes
-3. Daemons will automatically remove the peer on reload
+2. Run `limguard apply --config limguard.yaml`
+3. All remaining nodes receive the updated config and automatically remove the peer
+
+For local nodes: removing the node from config and running `apply` will update all remote nodes. To fully clean up the local machine, also stop and disable the service:
+```bash
+# Linux
+sudo systemctl stop limguard
+sudo systemctl disable limguard
+
+# macOS
+sudo launchctl unload /Library/LaunchDaemons/com.limrun.limguard.plist
+```
 
 ## Key Rotation
 

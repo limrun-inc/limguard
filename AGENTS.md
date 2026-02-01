@@ -7,7 +7,7 @@ WireGuard mesh network daemon. Single YAML config used for both deployment and r
 - `cmd/limguard/main.go` - CLI entrypoint (thin wrapper)
 - `config.go` - YAML config loading/validation, constants
 - `version.go` - Version variable (set at build time)
-- `run.go` - Run command: daemon lifecycle, config watching, peer reconciliation
+- `run.go` - Run command: daemon lifecycle, peer reconciliation
 - `deploy.go` - Apply command: SSH/SFTP helpers, service installation
 - `linux.go` / `darwin.go` - Platform-specific WireGuard NetworkManager
 
@@ -29,9 +29,7 @@ flowchart TD
         limguard.Run --> verifyPubkey[verify self pubkey matches]
         limguard.Run --> NewNetworkManager
         limguard.Run --> reconcilePeers
-        limguard.Run --> fsnotify[fsnotify.Watcher]
-        fsnotify -->|on_change| LoadConfig
-        fsnotify -->|on_change| reconcilePeers
+        limguard.Run --> waitForShutdown[wait for shutdown]
         reconcilePeers --> Config.GetPeers
         reconcilePeers -->|skip if no pubkey| nm.SetPeer
         reconcilePeers --> nm.RemovePeer

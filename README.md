@@ -72,15 +72,41 @@ nodes:
       host: "203.0.113.10"
       port: 22
       user: root
+
+  # Local node (join mesh from this machine)
+  ops-laptop:
+    wireguardIP: "10.200.0.50"
+    endpoint: "203.0.113.50"
+    ssh:
+      host: self               # Special value: configure locally, no SSH
 ```
 
 ## Commands
 
 ```bash
-limguard deploy --config limguard.yaml   # Deploy to all nodes
+limguard apply --config limguard.yaml   # Deploy to all nodes
 limguard run --config /etc/limguard/limguard.yaml  # Run daemon
-limguard bootstrap --config /etc/limguard/limguard.yaml  # Bootstrap interface
 ```
+
+## Joining the Mesh Locally
+
+You can temporarily join the mesh from your local machine (e.g., for operations):
+
+```yaml
+nodes:
+  ops-laptop:
+    wireguardIP: "10.200.0.50"
+    endpoint: "your.public.ip"
+    ssh:
+      host: self    # Special value: no SSH, configure locally
+```
+
+Run with root privileges:
+```bash
+sudo limguard apply --config limguard.yaml
+```
+
+To disconnect, remove the node from config and re-run `apply`. Other nodes will automatically remove it as a peer.
 
 ## How It Works
 

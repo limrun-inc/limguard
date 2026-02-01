@@ -32,11 +32,18 @@ type NetworkManager struct {
 
 // NewNetworkManager creates the WireGuard interface and configures it.
 func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP string, log *slog.Logger) (*NetworkManager, error) {
+	// On macOS, interface name must be utun[0-9]+ (e.g., utun9)
+	if !strings.HasPrefix(iface, "utun") {
+		return nil, fmt.Errorf("macOS interface name must start with 'utun' (e.g., utun9), got: %s", iface)
+	}
+
 	// Create interface if needed
 	if _, err := exec.Command("ifconfig", iface).Output(); err != nil {
-		if out, err := exec.Command("/opt/homebrew/bin/wireguard-go", iface).CombinedOutput(); err != nil {
+		out, err := exec.Command("/opt/homebrew/bin/wireguard-go", iface).CombinedOutput()
+		if err != nil {
 			return nil, fmt.Errorf("create interface: %s: %w", out, err)
 		}
+
 		// Wait for interface to become available
 		available := false
 		for i := 0; i < 20; i++ {
@@ -49,6 +56,7 @@ func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP
 		if !available {
 			return nil, fmt.Errorf("interface %s not available after wireguard-go started", iface)
 		}
+
 	}
 
 	// Add IP address

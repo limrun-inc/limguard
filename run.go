@@ -6,9 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"time"
-
-	"github.com/fsnotify/fsnotify"
 )
 
 // RunOptions holds options for the Run command.
@@ -71,62 +68,25 @@ func Run(ctx context.Context, args []string, log *slog.Logger) error {
 	// Print public key to stdout
 	fmt.Printf("LIMGUARD_PUBKEY=%s\n", derivedPubKey)
 
-	nm, err := NewNetworkManager(cfg.InterfaceName, cfg.PrivateKeyPath, cfg.ListenPort, self.WireguardIP, log)
+	// Parse listen port from our endpoint
+	listenPort, err := cfg.NodeListenPort(name)
+	if err != nil {
+		return fmt.Errorf("parse listen port: %w", err)
+	}
+
+	nm, err := NewNetworkManager(cfg.InterfaceName(name), cfg.PrivateKeyPath, listenPort, self.WireguardIP, log)
 	if err != nil {
 		return fmt.Errorf("init network: %w", err)
 	}
 	defer nm.Close()
 
-	// Initial peer sync
+	// Sync peers from config
 	reconcilePeers(ctx, nm, cfg, name, log)
 
-	// Watch config
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return fmt.Errorf("create file watcher: %w", err)
-	}
-	defer watcher.Close()
-
-	if err := watcher.Add(opts.ConfigPath); err != nil {
-		return fmt.Errorf("watch config file: %w", err)
-	}
-
-	var debounce *time.Timer
-	for {
-		select {
-		case <-ctx.Done():
-			log.Info("shutting down")
-			return nil
-		case ev, ok := <-watcher.Events:
-			if !ok {
-				return nil
-			}
-			if ev.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-				if debounce != nil {
-					debounce.Stop()
-				}
-				debounce = time.AfterFunc(500*time.Millisecond, func() {
-					newCfg, err := LoadConfig(opts.ConfigPath)
-					if err != nil {
-						log.Error("reload config", "error", err)
-						return
-					}
-					if err := newCfg.Validate(); err != nil {
-						log.Error("invalid config", "error", err)
-						return
-					}
-					cfg = newCfg
-					reconcilePeers(ctx, nm, cfg, name, log)
-					log.Info("config reloaded")
-				})
-			}
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return nil
-			}
-			log.Error("watcher error", "error", err)
-		}
-	}
+	// Wait for shutdown signal
+	<-ctx.Done()
+	log.Info("shutting down")
+	return nil
 }
 
 func parseRunArgs(args []string) (*RunOptions, error) {
@@ -152,7 +112,7 @@ func reconcilePeers(ctx context.Context, nm *NetworkManager, cfg *Config, selfNa
 			continue
 		}
 		desired[node.PublicKey] = true
-		endpoint := cfg.EndpointWithPort(node.Endpoint)
+		endpoint := cfg.PeerEndpoint(name)
 		if err := nm.SetPeer(ctx, node.PublicKey, endpoint, node.WireguardIP); err != nil {
 			log.Error("set peer", "error", err)
 		}
