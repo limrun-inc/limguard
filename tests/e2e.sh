@@ -144,8 +144,8 @@ create_vm() {
     fi
 }
 
-# Start a VM and wait for it to be ready
-start_vm() {
+# Print Lima logs for a VM
+print_lima_logs() {
     local name=$1
     local lima_dir
     if [[ -n "${SUDO_USER:-}" ]]; then
@@ -154,19 +154,6 @@ start_vm() {
         lima_dir="$HOME/.lima"
     fi
     
-    log "Starting VM $name..."
-    limactl_cmd start "$name" || true
-    
-    log "Waiting for VM $name to be ready..."
-    for i in {1..30}; do
-        if limactl_cmd shell "$name" -- echo "ready" &>/dev/null; then
-            log "VM $name is ready"
-            return 0
-        fi
-        sleep 1
-    done
-    
-    error "VM $name did not become ready"
     error "=== Lima logs for $name ==="
     if [[ -f "$lima_dir/$name/ha.stderr.log" ]]; then
         error "--- ha.stderr.log ---"
@@ -178,7 +165,20 @@ start_vm() {
             tail -100 "$serial_log" >&2
         fi
     done
-    exit 1
+}
+
+# Start a VM and wait for it to be ready
+start_vm() {
+    local name=$1
+    
+    log "Starting VM $name..."
+    if ! limactl_cmd start "$name"; then
+        error "Failed to start VM $name"
+        print_lima_logs "$name"
+        return 1
+    fi
+    
+    log "VM $name is ready"
 }
 
 # Get VM SSH port
