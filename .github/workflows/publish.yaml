@@ -6,7 +6,7 @@ on:
     tags:
       - 'v*'
 env:
-  GO_VERSION: '1.22'
+  GO_VERSION: '1.24'
 
 jobs:
   build:
@@ -40,21 +40,24 @@ jobs:
           
           # Linux
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-            -ldflags="-X 'github.com/limrun-inc/limguard/version.Version=${VERSION}'" \
-            -o dist/limguard-linux-amd64 ./cmd
+            -ldflags="-X 'github.com/limrun-inc/limguard.Version=${VERSION}'" \
+            -o dist/limguard-linux-amd64 ./cmd/limguard/
           
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build \
-            -ldflags="-X 'github.com/limrun-inc/limguard/version.Version=${VERSION}'" \
-            -o dist/limguard-linux-arm64 ./cmd
+            -ldflags="-X 'github.com/limrun-inc/limguard.Version=${VERSION}'" \
+            -o dist/limguard-linux-arm64 ./cmd/limguard/
           
           # macOS
           CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build \
-            -ldflags="-X 'github.com/limrun-inc/limguard/version.Version=${VERSION}'" \
-            -o dist/limguard-darwin-amd64 ./cmd
+            -ldflags="-X 'github.com/limrun-inc/limguard.Version=${VERSION}'" \
+            -o dist/limguard-darwin-amd64 ./cmd/limguard/
           
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build \
-            -ldflags="-X 'github.com/limrun-inc/limguard/version.Version=${VERSION}'" \
-            -o dist/limguard-darwin-arm64 ./cmd
+            -ldflags="-X 'github.com/limrun-inc/limguard.Version=${VERSION}'" \
+            -o dist/limguard-darwin-arm64 ./cmd/limguard/
+          
+          # Generate checksums
+          cd dist && sha256sum limguard-* > checksums.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

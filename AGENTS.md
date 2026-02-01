@@ -9,6 +9,7 @@ WireGuard mesh network daemon. Single YAML config used for both deployment and r
 - `version.go` - Version variable (set at build time)
 - `run.go` - Run command: daemon lifecycle, peer reconciliation
 - `deploy.go` - Apply command: SSH/SFTP helpers, service installation
+- `releases.go` - GitHub Releases download support (fetch binaries)
 - `linux.go` / `darwin.go` - Platform-specific WireGuard NetworkManager
 
 ## Call Flow
@@ -35,9 +36,13 @@ flowchart TD
         reconcilePeers --> nm.RemovePeer
     end
 
-    subgraph apply_command[Apply - deploy.go]
+    subgraph apply_command[Apply - deploy.go + releases.go]
         limguard.Apply --> LoadConfig
         limguard.Apply --> Config.ValidateForDeploy
+        limguard.Apply --> ResolveVersion[Resolve version if empty]
+        ResolveVersion --> Config.Save
+        limguard.Apply --> DownloadBinaries[Download binaries from GitHub]
+        DownloadBinaries --> ReleaseDownloader
 
         limguard.Apply --> Pass1[Pass1: Start services]
         Pass1 --> sshConnect
@@ -73,11 +78,17 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant Operator
+    participant GitHub
     participant LocalYAML
     participant Node1
     participant Node2
 
     Operator->>LocalYAML: Read config
+    Operator->>GitHub: Resolve version (latest if not set)
+    GitHub-->>Operator: version tag
+    Operator->>LocalYAML: Save resolved version
+    Operator->>GitHub: Download binaries for each platform
+    GitHub-->>Operator: limguard binaries
     
     Note over Operator,Node2: Pass 1: Start services
     Operator->>Node1: SSH + copy binary + minimal config

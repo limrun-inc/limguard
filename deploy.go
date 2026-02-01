@@ -137,6 +137,76 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 		return err
 	}
 
+	// Determine which platforms need downloading (nodes without localBinaryPath)
+	binaryPaths := make(map[string]string) // key: "os-arch", value: local path
+	var binaryPathsMu sync.Mutex
+	platformsNeedDownload := make(map[string]bool)
+
+	for name, node := range cfg.Nodes {
+		if node.LocalBinaryPath == "" {
+			nc := clients[name]
+			key := fmt.Sprintf("%s-%s", nc.osName, nc.arch)
+			platformsNeedDownload[key] = true
+		}
+	}
+
+	// Only download binaries if needed
+	if len(platformsNeedDownload) > 0 {
+		// Create release downloader
+		downloader, err := NewReleaseDownloader()
+		if err != nil {
+			return fmt.Errorf("create release downloader: %w", err)
+		}
+		defer downloader.Cleanup()
+
+		// Resolve version if not specified
+		if cfg.Version == "" {
+			log.Info("resolving latest release version")
+			version, err := downloader.ResolveLatestVersion()
+			if err != nil {
+				return fmt.Errorf("resolve latest version: %w", err)
+			}
+			cfg.Version = version
+			log.Info("resolved version", "version", version)
+
+			// Save config with resolved version immediately
+			if err := cfg.Save(opts.ConfigPath); err != nil {
+				return fmt.Errorf("save config with version: %w", err)
+			}
+			log.Info("saved config with resolved version")
+		} else {
+			log.Info("using specified version", "version", cfg.Version)
+		}
+
+		log.Info("downloading binaries from GitHub releases", "version", cfg.Version)
+
+		gDownload, _ := errgroup.WithContext(ctx)
+		for platform := range platformsNeedDownload {
+			platform := platform // capture
+			parts := strings.SplitN(platform, "-", 2)
+			osName, arch := parts[0], parts[1]
+
+			gDownload.Go(func() error {
+				log.Info("downloading binary", "platform", platform)
+				path, err := downloader.DownloadBinary(cfg.Version, osName, arch)
+				if err != nil {
+					return fmt.Errorf("download binary for %s: %w", platform, err)
+				}
+				binaryPathsMu.Lock()
+				binaryPaths[platform] = path
+				binaryPathsMu.Unlock()
+				log.Info("downloaded binary", "platform", platform, "path", path)
+				return nil
+			})
+		}
+
+		if err := gDownload.Wait(); err != nil {
+			return err
+		}
+	} else {
+		log.Info("all nodes have localBinaryPath set, skipping download")
+	}
+
 	// Pass 1: Bootstrap each node (in parallel)
 	log.Info("pass 1: bootstrapping nodes")
 	publicKeys := make(map[string]string)
@@ -150,8 +220,15 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 		g.Go(func() error {
 			log.Info("bootstrapping", "node", name)
 
-			binaryName := fmt.Sprintf("limguard-%s-%s", nc.osName, nc.arch)
-			srcBinaryPath := filepath.Join(cfg.ArtifactDir, binaryName)
+			// Use localBinaryPath if set, otherwise use downloaded binary
+			var srcBinaryPath string
+			if node.LocalBinaryPath != "" {
+				srcBinaryPath = node.LocalBinaryPath
+				log.Info("using local binary", "node", name, "path", srcBinaryPath)
+			} else {
+				platform := fmt.Sprintf("%s-%s", nc.osName, nc.arch)
+				srcBinaryPath = binaryPaths[platform]
+			}
 
 			// Check if binary needs to be copied (compare SHA256 hashes)
 			srcHash, err := fileSHA256(srcBinaryPath)
@@ -161,9 +238,9 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 
 			var installedHash string
 			if nc.local {
-				installedHash, _ = fileSHA256(cfg.BinaryPath)
+				installedHash, _ = fileSHA256(DefaultBinaryPath)
 			} else {
-				installedHash, _ = remoteFileSHA256(nc.ssh, nc.sftp, cfg.BinaryPath)
+				installedHash, _ = remoteFileSHA256(nc.ssh, nc.sftp, DefaultBinaryPath)
 			}
 
 			if srcHash != installedHash {
@@ -186,7 +263,6 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 			minCfg := &Config{
 				LinuxInterfaceName:  cfg.LinuxInterfaceName,
 				DarwinInterfaceName: cfg.DarwinInterfaceName,
-				PrivateKeyPath:      cfg.PrivateKeyPath,
 				Nodes:               map[string]Node{name: {WireguardIP: node.WireguardIP, Endpoint: node.Endpoint, PublicKey: "", InterfaceName: node.InterfaceName}},
 			}
 			tmpCfg := "/tmp/limguard-bootstrap.yaml"
@@ -209,8 +285,8 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 mkdir -p %s %s
 if [ -f /tmp/limguard-binary ]; then mv /tmp/limguard-binary %s && chmod 755 %s; fi
 mv %s %s
-`, filepath.Dir(DefaultConfigPath), filepath.Dir(cfg.PrivateKeyPath),
-				cfg.BinaryPath, cfg.BinaryPath,
+`, filepath.Dir(DefaultConfigPath), filepath.Dir(DefaultPrivateKeyPath),
+				DefaultBinaryPath, DefaultBinaryPath,
 				tmpCfg, DefaultConfigPath)
 
 			if nc.local {
@@ -225,17 +301,17 @@ mv %s %s
 
 			// Install and start service (runs limguard run, which bootstraps if needed)
 			if nc.osName == "linux" {
-				if err := installLinuxService(nc.ssh, nc.sftp, nc.isRoot, nc.local, cfg, name); err != nil {
+				if err := installLinuxService(nc.ssh, nc.sftp, nc.isRoot, nc.local, name); err != nil {
 					return fmt.Errorf("install linux service on %s: %w", name, err)
 				}
 			} else {
-				if err := installDarwinService(nc.ssh, nc.sftp, nc.isRoot, nc.local, cfg, name); err != nil {
+				if err := installDarwinService(nc.ssh, nc.sftp, nc.isRoot, nc.local, name); err != nil {
 					return fmt.Errorf("install darwin service on %s: %w", name, err)
 				}
 			}
 
 			// Poll for pubkey file (written by limguard run on startup)
-			pubkeyPath := cfg.PrivateKeyPath + ".pub"
+			pubkeyPath := DefaultPrivateKeyPath + ".pub"
 			var pubKey string
 			if nc.local {
 				pubKey, err = waitForLocalPubkey(pubkeyPath, 3*time.Second)
@@ -820,7 +896,7 @@ func remoteFileSHA256(sshClient *ssh.Client, sftpClient *sftp.Client, path strin
 	return sftpFileSHA256(sftpClient, path)
 }
 
-func installLinuxService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, local bool, cfg *Config, nodeName string) error {
+func installLinuxService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, local bool, nodeName string) error {
 	service := fmt.Sprintf(`[Unit]
 Description=limguard WireGuard mesh network manager
 After=network-online.target
@@ -846,7 +922,7 @@ SyslogIdentifier=limguard
 
 [Install]
 WantedBy=multi-user.target
-`, cfg.BinaryPath, DefaultConfigPath, nodeName)
+`, DefaultBinaryPath, DefaultConfigPath, nodeName)
 
 	tmpService := "/tmp/limguard.service"
 	if local {
@@ -864,7 +940,7 @@ WantedBy=multi-user.target
 	return err
 }
 
-func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, local bool, cfg *Config, nodeName string) error {
+func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, local bool, nodeName string) error {
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -890,7 +966,7 @@ func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot
     <string>/var/log/limguard.log</string>
 </dict>
 </plist>
-`, cfg.BinaryPath, DefaultConfigPath, nodeName)
+`, DefaultBinaryPath, DefaultConfigPath, nodeName)
 
 	plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
 	tmpPlist := "/tmp/com.limrun.limguard.plist"

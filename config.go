@@ -39,11 +39,12 @@ type SSH struct {
 
 // Node represents a node in the WireGuard mesh.
 type Node struct {
-	WireguardIP   string `yaml:"wireguardIP"`
-	Endpoint      string `yaml:"endpoint"`               // Must be host:port format
-	PublicKey     string `yaml:"publicKey,omitempty"`     // Filled in after bootstrap
-	InterfaceName string `yaml:"interfaceName,omitempty"` // Per-node override
-	SSH           *SSH   `yaml:"ssh,omitempty"`           // Used only by deploy command
+	WireguardIP     string `yaml:"wireguardIP"`
+	Endpoint        string `yaml:"endpoint"`                 // Must be host:port format
+	PublicKey       string `yaml:"publicKey,omitempty"`       // Filled in after bootstrap
+	InterfaceName   string `yaml:"interfaceName,omitempty"`   // Per-node override
+	LocalBinaryPath string `yaml:"localBinaryPath,omitempty"` // Local binary to use instead of downloading
+	SSH             *SSH   `yaml:"ssh,omitempty"`             // Used only by deploy command
 }
 
 // Config is the unified configuration for limguard.
@@ -51,9 +52,7 @@ type Node struct {
 type Config struct {
 	LinuxInterfaceName  string          `yaml:"linuxInterfaceName,omitempty"`  // Default for Linux nodes
 	DarwinInterfaceName string          `yaml:"darwinInterfaceName,omitempty"` // Default for macOS nodes
-	PrivateKeyPath      string          `yaml:"privateKeyPath,omitempty"`
-	BinaryPath          string          `yaml:"binaryPath,omitempty"`  // Used by deploy
-	ArtifactDir         string          `yaml:"artifactDir,omitempty"` // Used by deploy (local binaries)
+	Version             string          `yaml:"version,omitempty"`             // GitHub release tag (e.g., v1.0.0); resolved to latest if empty
 	Nodes               map[string]Node `yaml:"nodes"`
 }
 
@@ -77,12 +76,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.DarwinInterfaceName == "" {
 		c.DarwinInterfaceName = DefaultDarwinInterfaceName
-	}
-	if c.PrivateKeyPath == "" {
-		c.PrivateKeyPath = DefaultPrivateKeyPath
-	}
-	if c.BinaryPath == "" {
-		c.BinaryPath = DefaultBinaryPath
 	}
 	for name, node := range c.Nodes {
 		if node.SSH != nil {
@@ -166,9 +159,6 @@ func (c *Config) Validate() error {
 func (c *Config) ValidateForDeploy() error {
 	if err := c.Validate(); err != nil {
 		return err
-	}
-	if c.ArtifactDir == "" {
-		return fmt.Errorf("artifactDir required for deploy")
 	}
 	for name, node := range c.Nodes {
 		if node.SSH == nil || node.SSH.Host == "" {

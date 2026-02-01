@@ -4,7 +4,7 @@
 #
 # Prerequisites:
 # - Lima (brew install lima)
-# - Go 1.21+
+# - Go 1.24+
 # - SSH key (~/.ssh/id_ed25519 or ~/.ssh/id_rsa)
 
 set -euo pipefail
@@ -145,10 +145,9 @@ enable_ssh_access() {
     "
 }
 
-# Build binaries
-build_binaries() {
-    log "Building limguard binaries..."
-    mkdir -p "$TMPDIR/dist"
+# Build limguard binary for target platform
+build_binary() {
+    log "Building limguard binary..."
     
     # Detect architecture
     local arch="arm64"
@@ -156,9 +155,11 @@ build_binaries() {
         arch="amd64"
     fi
     
-    log "Building limguard-linux-$arch..."
+    BINARY_PATH="$TMPDIR/limguard-linux-$arch"
+    log "Building $BINARY_PATH..."
     cd "$PROJECT_ROOT"
-    GOOS=linux GOARCH=$arch go build -o "$TMPDIR/dist/limguard-linux-$arch" ./cmd/limguard/
+    GOOS=linux GOARCH=$arch go build -o "$BINARY_PATH" ./cmd/limguard/
+    log "Binary built: $BINARY_PATH"
 }
 
 # Create test config
@@ -174,15 +175,12 @@ create_config() {
     cat > "$TMPDIR/limguard.yaml" << EOF
 linuxInterfaceName: wg0
 darwinInterfaceName: utun9
-privateKeyPath: /etc/limguard/privatekey
-binaryPath: /usr/local/bin/limguard
-artifactDir: $TMPDIR/dist
 
 nodes:
   $NODE1:
     wireguardIP: "$WG_IP1"
     endpoint: "$endpoint1:51820"
-    publicKey: ""
+    localBinaryPath: "$BINARY_PATH"
     ssh:
       host: "127.0.0.1"
       port: $ssh_port1
@@ -192,7 +190,7 @@ nodes:
   $NODE2:
     wireguardIP: "$WG_IP2"
     endpoint: "$endpoint2:51820"
-    publicKey: ""
+    localBinaryPath: "$BINARY_PATH"
     ssh:
       host: "127.0.0.1"
       port: $ssh_port2
@@ -282,13 +280,13 @@ main() {
     pid2=$!
     wait $pid1 $pid2
     
-    # Step 4: Build binaries
-    build_binaries
+    # Step 4: Build binary
+    build_binary
     
     # Step 5: Create config
     create_config "$SSH_PORT1" "$SSH_PORT2" "$ENDPOINT1" "$ENDPOINT2"
     
-    # Step 6: Run apply
+    # Step 6: Run apply (uses local binary)
     run_apply
     
     # Wait for services to stabilize

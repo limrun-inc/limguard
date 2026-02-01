@@ -48,7 +48,7 @@ func Run(ctx context.Context, args []string, log *slog.Logger) error {
 	}
 
 	// Bootstrap: ensure private key exists (generate if needed)
-	privateKey, err := EnsurePrivateKey(cfg.PrivateKeyPath)
+	privateKey, err := EnsurePrivateKey(DefaultPrivateKeyPath)
 	if err != nil {
 		return fmt.Errorf("ensure private key: %w", err)
 	}
@@ -60,7 +60,7 @@ func Run(ctx context.Context, args []string, log *slog.Logger) error {
 	}
 
 	// Write pubkey to file for apply command to read
-	pubkeyPath := cfg.PrivateKeyPath + ".pub"
+	pubkeyPath := DefaultPrivateKeyPath + ".pub"
 	if err := os.WriteFile(pubkeyPath, []byte(derivedPubKey+"\n"), 0644); err != nil {
 		return fmt.Errorf("write public key file: %w", err)
 	}
@@ -74,7 +74,7 @@ func Run(ctx context.Context, args []string, log *slog.Logger) error {
 		return fmt.Errorf("parse listen port: %w", err)
 	}
 
-	nm, err := NewNetworkManager(cfg.InterfaceName(name), cfg.PrivateKeyPath, listenPort, self.WireguardIP, log)
+	nm, err := NewNetworkManager(cfg.InterfaceName(name), DefaultPrivateKeyPath, listenPort, self.WireguardIP, log)
 	if err != nil {
 		return fmt.Errorf("init network: %w", err)
 	}

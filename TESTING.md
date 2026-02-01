@@ -4,10 +4,11 @@ This guide covers testing limguard using Lima VMs on macOS.
 
 ## Prerequisites
 
-- Go 1.21+
+- Go 1.24+
 - Lima (`brew install lima`)
 - socket_vmnet for shared networking (see [tests/README.md](tests/README.md) for full setup)
 - SSH key pair (`~/.ssh/id_ed25519` or `~/.ssh/id_rsa`)
+- Internet access (to download binaries from GitHub releases)
 
 ## Integration Tests
 
@@ -21,7 +22,7 @@ Deploys limguard to two Lima VMs and verifies mesh connectivity:
 
 The test will:
 1. Create two Lima VMs (`limguard-test-1`, `limguard-test-2`)
-2. Build and deploy limguard to both VMs
+2. Download and deploy limguard to both VMs
 3. Verify mesh connectivity between VMs
 4. Clean up VMs
 
@@ -43,9 +44,9 @@ sudo ./tests/integration-local.sh
 
 The test will:
 1. Create two Lima VMs
-2. Build binaries for Linux (VMs) and your local OS
+2. Download binaries for Linux (VMs) and your local OS from GitHub releases
 3. Deploy limguard to VMs and local machine (using `ssh.host: self`)
-4. Verify full mesh connectivity (VMs ↔ VMs ↔ local)
+4. Verify full mesh connectivity (VMs <-> VMs <-> local)
 5. Clean up VMs and local service
 
 To keep everything for debugging:
@@ -116,7 +117,7 @@ echo "Endpoint for node-1: $(limactl shell node-1 -- ip addr show eth0 | grep 'i
 echo "SSH information for node-2:"
 echo "127.0.0.1:$(limactl show-ssh node-2 2>/dev/null | grep -o 'Port=[0-9]*' | cut -d= -f2)"
 
-echo "Endpoing for node-2: $(limactl shell node-2 -- ip addr show eth0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)"
+echo "Endpoint for node-2: $(limactl shell node-2 -- ip addr show eth0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)"
 ```
 
 Note both the SSH ports and VM IPs.
@@ -131,35 +132,19 @@ limactl shell node-1 -- bash -c "mkdir -p ~/.ssh && echo '$(cat ~/.ssh/id_ed2551
 limactl shell node-2 -- bash -c "mkdir -p ~/.ssh && echo '$(cat ~/.ssh/id_ed25519.pub)' >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
 ```
 
-### 4. Build limguard Binaries
-
-```bash
-# From the limguard repo root
-mkdir -p dist
-
-# Build for Linux ARM64 (Lima on Apple Silicon)
-GOOS=linux GOARCH=arm64 go build -o dist/limguard-linux-arm64 ./cmd/limguard/
-
-# Build for Linux AMD64 (Lima on Intel Mac)
-GOOS=linux GOARCH=amd64 go build -o dist/limguard-linux-amd64 ./cmd/limguard/
-```
-
-### 5. Create Test Config
+### 4. Create Test Config
 
 Create `test-limguard.yaml` with the values from step 2:
 
 ```yaml
-interfaceName: wg0
-listenPort: 51820
-privateKeyPath: /etc/limguard/privatekey
-binaryPath: /usr/local/bin/limguard
-artifactDir: ./dist
+linuxInterfaceName: wg0
+
+# version: v1.0.0  # Optional: pin to specific version, otherwise latest is used
 
 nodes:
   node-1:
     wireguardIP: "10.200.0.1"
-    endpoint: "VM_IP_1"          # VM IP from step 2 (e.g., 192.168.104.2)
-    publicKey: ""
+    endpoint: "VM_IP_1:51820"    # VM IP from step 2 (e.g., 192.168.104.2:51820)
     ssh:
       host: "127.0.0.1"          # Lima uses localhost
       port: SSH_PORT_1           # SSH port from step 2 (e.g., 55928)
@@ -168,8 +153,7 @@ nodes:
 
   node-2:
     wireguardIP: "10.200.0.2"
-    endpoint: "VM_IP_2"          # VM IP from step 2 (e.g., 192.168.104.3)
-    publicKey: ""
+    endpoint: "VM_IP_2:51820"    # VM IP from step 2 (e.g., 192.168.104.3:51820)
     ssh:
       host: "127.0.0.1"          # Lima uses localhost
       port: SSH_PORT_2           # SSH port from step 2 (e.g., 55935)
@@ -182,13 +166,15 @@ Replace:
 - `SSH_PORT_1`, `SSH_PORT_2` with the SSH ports from step 2
 - `YOUR_USERNAME` with your macOS username
 
-### 6. Run Apply
+### 5. Run Apply
 
 ```bash
 go run ./cmd/limguard/ apply --config test-limguard.yaml
 ```
 
-### 7. Verify the Mesh
+This will automatically download the correct binaries from GitHub releases.
+
+### 6. Verify the Mesh
 
 ```bash
 # Ping node-2 from node-1 via WireGuard tunnel
@@ -198,7 +184,7 @@ limactl shell node-1 -- ping -c 3 10.200.0.2
 limactl shell node-2 -- ping -c 3 10.200.0.1
 ```
 
-### 8. Check Service Status
+### 7. Check Service Status
 
 ```bash
 # Check limguard service status
@@ -209,7 +195,7 @@ limactl shell node-2 -- sudo systemctl status limguard --no-pager
 limactl shell node-1 -- sudo journalctl -u limguard -n 20 --no-pager
 ```
 
-### 9. Cleanup
+### 8. Cleanup
 
 ```bash
 # Stop and delete VMs
@@ -253,3 +239,12 @@ limactl shell node-1 -- sudo journalctl -u limguard -n 50 --no-pager
 2. Check the interface has the correct IP: `ip addr show wg0`
 3. Verify VMs can reach each other on endpoint IPs: `ping <other-vm-ip>`
 4. Check firewall rules: `sudo iptables -L -n`
+
+### GitHub rate limits
+
+If you encounter GitHub API rate limits when downloading binaries, set a GitHub token:
+
+```bash
+export GITHUB_TOKEN=your_token_here
+go run ./cmd/limguard/ apply --config test-limguard.yaml
+```

@@ -2,14 +2,15 @@
 linuxInterfaceName: wg0     # Used on Linux nodes
 darwinInterfaceName: utun9  # Used on macOS nodes (must be utun[0-9]+)
 
-privateKeyPath: /etc/limguard/privatekey
-binaryPath: /usr/local/bin/limguard
-artifactDir: ./dist
+# Version of limguard to download from GitHub releases.
+# If omitted, the latest release is fetched and written back to this file.
+# version: v1.0.0
 
 nodes:
     node-1:
         wireguardIP: 10.200.0.1
         endpoint: 192.168.104.1:51820  # Must be host:port format
+        # localBinaryPath: /path/to/limguard  # Optional: use local binary instead of downloading
         ssh:
             host: 127.0.0.1
             port: 56614

@@ -6,7 +6,7 @@
 # Prerequisites:
 # - Lima (brew install lima)
 # - socket_vmnet (see tests/README.md for setup)
-# - Go 1.21+
+# - Go 1.24+
 # - SSH key (~/.ssh/id_ed25519 or ~/.ssh/id_rsa)
 # - Root privileges (sudo)
 
@@ -187,10 +187,9 @@ enable_ssh_access() {
     "
 }
 
-# Build binaries
+# Build limguard binaries for Linux (VMs) and Darwin (local)
 build_binaries() {
     log "Building limguard binaries..."
-    mkdir -p "$TMPDIR/dist"
     
     # Detect architecture
     local arch="arm64"
@@ -198,12 +197,17 @@ build_binaries() {
         arch="amd64"
     fi
     
-    log "Building limguard-linux-$arch..."
-    cd "$PROJECT_ROOT"
-    GOOS=linux GOARCH=$arch go build -o "$TMPDIR/dist/limguard-linux-$arch" ./cmd/limguard/
+    LINUX_BINARY_PATH="$TMPDIR/limguard-linux-$arch"
+    DARWIN_BINARY_PATH="$TMPDIR/limguard-darwin-$arch"
     
-    log "Building limguard-darwin-$arch..."
-    GOOS=darwin GOARCH=$arch go build -o "$TMPDIR/dist/limguard-darwin-$arch" ./cmd/limguard/
+    log "Building $LINUX_BINARY_PATH..."
+    cd "$PROJECT_ROOT"
+    GOOS=linux GOARCH=$arch go build -o "$LINUX_BINARY_PATH" ./cmd/limguard/
+    
+    log "Building $DARWIN_BINARY_PATH..."
+    GOOS=darwin GOARCH=$arch go build -o "$DARWIN_BINARY_PATH" ./cmd/limguard/
+    
+    log "Binaries built"
 }
 
 # Create test config
@@ -225,15 +229,12 @@ create_config() {
     cat > "$TMPDIR/limguard.yaml" << EOF
 linuxInterfaceName: wg0
 darwinInterfaceName: utun9
-privateKeyPath: /etc/limguard/privatekey
-binaryPath: /usr/local/bin/limguard
-artifactDir: $TMPDIR/dist
 
 nodes:
   $NODE1:
     wireguardIP: "$WG_IP1"
     endpoint: "$endpoint1:51820"
-    publicKey: ""
+    localBinaryPath: "$LINUX_BINARY_PATH"
     ssh:
       host: "127.0.0.1"
       port: $ssh_port1
@@ -243,7 +244,7 @@ nodes:
   $NODE2:
     wireguardIP: "$WG_IP2"
     endpoint: "$endpoint2:51820"
-    publicKey: ""
+    localBinaryPath: "$LINUX_BINARY_PATH"
     ssh:
       host: "127.0.0.1"
       port: $ssh_port2
@@ -254,7 +255,7 @@ nodes:
     wireguardIP: "$WG_IP_LOCAL"
     endpoint: "$local_endpoint:51821"
     interfaceName: utun9
-    publicKey: ""
+    localBinaryPath: "$DARWIN_BINARY_PATH"
     ssh:
       host: self
 EOF
@@ -363,7 +364,7 @@ main() {
     # Step 5: Create config
     create_config "$SSH_PORT1" "$SSH_PORT2" "$ENDPOINT1" "$ENDPOINT2" "$LOCAL_ENDPOINT"
     
-    # Step 6: Run apply
+    # Step 6: Run apply (uses local binaries)
     run_apply
     
     # Wait for services to stabilize
