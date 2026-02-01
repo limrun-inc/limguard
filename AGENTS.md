@@ -4,7 +4,7 @@ WireGuard mesh network daemon. Single YAML config used for both deployment and r
 
 ## Files
 
-- `cmd/main.go` - CLI: run, bootstrap, deploy commands
+- `cmd/main.go` - CLI: run, apply commands
 - `config/config.go` - YAML config loading/validation
 - `linux.go` / `darwin.go` - Platform-specific WireGuard management
 
@@ -14,53 +14,47 @@ WireGuard mesh network daemon. Single YAML config used for both deployment and r
 flowchart TD
     subgraph main
         M[main] --> cmdRun
-        M --> cmdBootstrap
-        M --> cmdDeploy
+        M --> cmdApply
     end
 
-    subgraph run_command
+    subgraph run_command[run command - idempotent]
         cmdRun --> config.Load
         cmdRun --> config.Validate
         cmdRun --> config.GetSelf
+        cmdRun --> config.EnsurePrivateKey
+        config.EnsurePrivateKey -->|writes| PubkeyFile[privatekey.pub]
+        cmdRun --> verifyPubkey[verify self pubkey matches]
         cmdRun --> NewNetworkManager
         cmdRun --> reconcilePeers
         cmdRun --> fsnotify[fsnotify.Watcher]
         fsnotify -->|on_change| config.Load
         fsnotify -->|on_change| reconcilePeers
         reconcilePeers --> config.GetPeers
-        reconcilePeers --> nm.SetPeer
+        reconcilePeers -->|skip if no pubkey| nm.SetPeer
         reconcilePeers --> nm.RemovePeer
     end
 
-    subgraph bootstrap_command
-        cmdBootstrap --> config.Load
-        cmdBootstrap --> config.GetSelf
-        cmdBootstrap --> config.EnsurePrivateKey
-        cmdBootstrap --> NewNetworkManager
-        cmdBootstrap -->|stdout| PublicKey
-    end
+    subgraph apply_command
+        cmdApply --> config.Load
+        cmdApply --> config.ValidateForDeploy
 
-    subgraph deploy_command
-        cmdDeploy --> config.Load
-        cmdDeploy --> config.ValidateForDeploy
-
-        cmdDeploy --> Pass1[Pass1: Bootstrap]
+        cmdApply --> Pass1[Pass1: Start services]
         Pass1 --> sshConnect
         Pass1 --> detectPlatform
-        Pass1 --> scpFile
+        Pass1 --> fileSHA256[SHA256 hash check]
+        fileSHA256 -->|if changed| scpFile
         Pass1 --> writeRemoteFile
-        Pass1 --> sshRun
-        sshRun -->|remote| cmdBootstrap
+        Pass1 --> installLinuxService
+        Pass1 --> installDarwinService
+        Pass1 --> waitForPubkey
+        waitForPubkey -->|reads| PubkeyFile
 
-        cmdDeploy --> config.Save
+        cmdApply --> config.Save
         
-        cmdDeploy --> Pass2[Pass2: Distribute]
+        cmdApply --> Pass2[Pass2: Distribute and restart]
         Pass2 --> sshConnect
         Pass2 --> writeRemoteFile
-        Pass2 --> installLinuxService
-        Pass2 --> installDarwinService
-        installLinuxService --> sshRun
-        installDarwinService --> sshRun
+        Pass2 --> restartService[systemctl restart]
     end
 
     subgraph network_manager[NetworkManager linux.go/darwin.go]
@@ -84,21 +78,23 @@ sequenceDiagram
 
     Operator->>LocalYAML: Read config
     
-    Note over Operator,Node2: Pass 1: Bootstrap
-    Operator->>Node1: SSH + copy binary
-    Operator->>Node1: limguard bootstrap
+    Note over Operator,Node2: Pass 1: Start services
+    Operator->>Node1: SSH + copy binary + minimal config
+    Operator->>Node1: Install and start service
+    Node1->>Node1: limguard run (bootstraps, writes pubkey file)
+    Operator->>Node1: Poll for pubkey file
     Node1-->>Operator: public key
-    Operator->>Node2: SSH + copy binary
-    Operator->>Node2: limguard bootstrap
+    Operator->>Node2: SSH + copy binary + minimal config
+    Operator->>Node2: Install and start service
+    Node2->>Node2: limguard run (bootstraps, writes pubkey file)
+    Operator->>Node2: Poll for pubkey file
     Node2-->>Operator: public key
     
     Operator->>LocalYAML: Update with public keys
     
-    Note over Operator,Node2: Pass 2: Distribute
-    Operator->>Node1: Copy full YAML
-    Operator->>Node1: Start daemon
-    Operator->>Node2: Copy full YAML
-    Operator->>Node2: Start daemon
+    Note over Operator,Node2: Pass 2: Distribute config and restart
+    Operator->>Node1: Copy full YAML + restart service
+    Operator->>Node2: Copy full YAML + restart service
     
     Node1->>Node2: WireGuard peers configured
     Node2->>Node1: WireGuard peers configured

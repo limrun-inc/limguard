@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -34,10 +36,8 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		cmdRun(os.Args[2:])
-	case "bootstrap":
-		cmdBootstrap(os.Args[2:])
-	case "deploy":
-		cmdDeploy(os.Args[2:])
+	case "apply":
+		cmdApply(os.Args[2:])
 	case "version":
 		fmt.Println(version.Version)
 	default:
@@ -50,9 +50,8 @@ func usage() {
 	fmt.Println(`limguard - WireGuard mesh network manager
 
 Commands:
-  run        Run the daemon
-  bootstrap  Bootstrap interface and print public key
-  deploy     Deploy to nodes via SSH
+  run        Run the daemon (bootstraps if needed)
+  apply      Deploy to nodes via SSH
   version    Print version`)
 }
 
@@ -89,6 +88,30 @@ func cmdRun(args []string) {
 		log.Error("node not in config", "node", name)
 		os.Exit(1)
 	}
+
+	// Bootstrap: ensure private key exists (generate if needed)
+	privateKey, err := config.EnsurePrivateKey(cfg.PrivateKeyPath)
+	if err != nil {
+		log.Error("ensure private key", "error", err)
+		os.Exit(1)
+	}
+
+	// Verify self's publicKey matches local key (if YAML has one)
+	derivedPubKey := privateKey.PublicKey().String()
+	if self.PublicKey != "" && self.PublicKey != derivedPubKey {
+		log.Error("publicKey mismatch", "yaml", self.PublicKey, "derived", derivedPubKey)
+		os.Exit(1)
+	}
+
+	// Write pubkey to file for apply command to read
+	pubkeyPath := cfg.PrivateKeyPath + ".pub"
+	if err := os.WriteFile(pubkeyPath, []byte(derivedPubKey+"\n"), 0644); err != nil {
+		log.Error("write public key file", "error", err)
+		os.Exit(1)
+	}
+
+	// Print public key to stdout
+	fmt.Printf("LIMGUARD_PUBKEY=%s\n", derivedPubKey)
 
 	nm, err := limguard.NewNetworkManager(cfg.InterfaceName, cfg.PrivateKeyPath, cfg.ListenPort, self.WireguardIP, log)
 	if err != nil {
@@ -184,7 +207,12 @@ func reconcilePeers(ctx context.Context, nm *limguard.NetworkManager, cfg *confi
 	peers := cfg.GetPeers(selfName)
 	desired := make(map[string]bool)
 
-	for _, node := range peers {
+	for name, node := range peers {
+		// Skip peers without publicKey (not yet bootstrapped)
+		if node.PublicKey == "" {
+			log.Warn("skipping peer without publicKey", "peer", name)
+			continue
+		}
 		desired[node.PublicKey] = true
 		endpoint := cfg.EndpointWithPort(node.Endpoint)
 		if err := nm.SetPeer(ctx, node.PublicKey, endpoint, node.WireguardIP); err != nil {
@@ -202,54 +230,10 @@ func reconcilePeers(ctx context.Context, nm *limguard.NetworkManager, cfg *confi
 	return desired
 }
 
-// --- bootstrap command ---
+// --- apply command ---
 
-func cmdBootstrap(args []string) {
-	fs := flag.NewFlagSet("bootstrap", flag.ExitOnError)
-	cfgPath := fs.String("config", config.DefaultConfigPath, "Config file path")
-	nodeName := fs.String("node-name", "", "Node name (default: hostname)")
-	debug := fs.Bool("debug", false, "Debug logging")
-	fs.Parse(args)
-
-	// Log to stderr so stdout is reserved for public key
-	log := newLoggerStderr(*debug)
-
-	name := *nodeName
-	if name == "" {
-		name, _ = os.Hostname()
-	}
-
-	cfg, err := config.Load(*cfgPath)
-	if err != nil {
-		log.Error("load config", "error", err)
-		os.Exit(1)
-	}
-
-	self, ok := cfg.GetSelf(name)
-	if !ok {
-		log.Error("node not in config", "node", name)
-		os.Exit(1)
-	}
-
-	privateKey, err := config.EnsurePrivateKey(cfg.PrivateKeyPath)
-	if err != nil {
-		log.Error("ensure private key", "error", err)
-		os.Exit(1)
-	}
-
-	_, err = limguard.NewNetworkManager(cfg.InterfaceName, cfg.PrivateKeyPath, cfg.ListenPort, self.WireguardIP, log)
-	if err != nil {
-		log.Error("init network", "error", err)
-		os.Exit(1)
-	}
-
-	fmt.Println(privateKey.PublicKey().String())
-}
-
-// --- deploy command ---
-
-func cmdDeploy(args []string) {
-	fs := flag.NewFlagSet("deploy", flag.ExitOnError)
+func cmdApply(args []string) {
+	fs := flag.NewFlagSet("apply", flag.ExitOnError)
 	cfgPath := fs.String("config", "limguard.yaml", "Config file path")
 	sshKey := fs.String("ssh-key", "", "SSH private key path")
 	debug := fs.Bool("debug", false, "Debug logging")
@@ -282,41 +266,68 @@ func cmdDeploy(args []string) {
 
 		osName, arch := detectPlatform(client)
 		binaryName := fmt.Sprintf("limguard-%s-%s", osName, arch)
-		binaryPath := filepath.Join(cfg.ArtifactDir, binaryName)
+		localBinaryPath := filepath.Join(cfg.ArtifactDir, binaryName)
 
-		// Copy binary
-		if err := scpFile(client, binaryPath, cfg.BinaryPath, 0755); err != nil {
-			log.Error("copy binary", "node", name, "error", err)
+		// Check if binary needs to be copied (compare SHA256 hashes)
+		localHash, err := fileSHA256(localBinaryPath)
+		if err != nil {
+			log.Error("compute local binary hash", "node", name, "error", err)
 			os.Exit(1)
 		}
+		remoteHash, _ := sshRun(client, fmt.Sprintf("sha256sum %s 2>/dev/null | cut -d' ' -f1", cfg.BinaryPath))
+		remoteHash = strings.TrimSpace(remoteHash)
 
-		// Create directories
-		sshRun(client, fmt.Sprintf("mkdir -p %s %s",
+		if localHash != remoteHash {
+			log.Info("copying binary", "node", name, "localHash", localHash[:8], "remoteHash", remoteHash[:min(8, len(remoteHash))])
+			// Copy binary (write to temp, then sudo mv to final location)
+			tmpBinary := "/tmp/limguard-binary"
+			if err := scpFile(client, localBinaryPath, tmpBinary, 0755); err != nil {
+				log.Error("copy binary", "node", name, "error", err)
+				os.Exit(1)
+			}
+			if _, err := sshRun(client, fmt.Sprintf("sudo mv %s %s && sudo chmod 755 %s", tmpBinary, cfg.BinaryPath, cfg.BinaryPath)); err != nil {
+				log.Error("install binary", "node", name, "error", err)
+				os.Exit(1)
+			}
+		} else {
+			log.Info("binary unchanged", "node", name, "sha256", localHash[:8])
+		}
+
+		// Create directories (with sudo for system paths)
+		sshRun(client, fmt.Sprintf("sudo mkdir -p %s %s",
 			filepath.Dir(config.DefaultConfigPath),
 			filepath.Dir(cfg.PrivateKeyPath)))
 
-		// Write minimal config for this node
+		// Write minimal config for this node (empty publicKey to skip validation during bootstrap)
 		minCfg := &config.Config{
 			InterfaceName:  cfg.InterfaceName,
 			ListenPort:     cfg.ListenPort,
 			PrivateKeyPath: cfg.PrivateKeyPath,
-			Nodes:          map[string]config.Node{name: {WireguardIP: node.WireguardIP, Endpoint: node.Endpoint, PublicKey: "placeholder"}},
+			Nodes:          map[string]config.Node{name: {WireguardIP: node.WireguardIP, Endpoint: node.Endpoint, PublicKey: ""}},
 		}
 		tmpCfg := "/tmp/limguard-bootstrap.yaml"
 		writeRemoteFile(client, tmpCfg, mustMarshal(minCfg))
-		sshRun(client, fmt.Sprintf("mv %s %s", tmpCfg, config.DefaultConfigPath))
+		sshRun(client, fmt.Sprintf("sudo mv %s %s", tmpCfg, config.DefaultConfigPath))
 
-		// Bootstrap
-		out, err := sshRun(client, fmt.Sprintf("%s bootstrap --config %s --node-name %s",
-			cfg.BinaryPath, config.DefaultConfigPath, name))
-		if err != nil {
-			log.Error("bootstrap", "node", name, "error", err, "output", out)
-			os.Exit(1)
+		// Install and start service (runs limguard run, which bootstraps if needed)
+		if osName == "linux" {
+			installLinuxService(client, cfg, name)
+		} else {
+			installDarwinService(client, cfg, name)
 		}
 
-		pubKey := strings.TrimSpace(out)
-		if pubKey == "" {
-			log.Error("bootstrap returned empty public key", "node", name)
+		// Poll for pubkey file (written by limguard run on startup)
+		pubkeyPath := cfg.PrivateKeyPath + ".pub"
+		pubKey, err := waitForPubkey(client, pubkeyPath, 3*time.Second)
+		if err != nil {
+			// Fetch service logs to show what went wrong
+			var serviceLogs string
+			if osName == "linux" {
+				serviceLogs, _ = sshRun(client, "sudo journalctl -u limguard -n 50 --no-pager 2>&1")
+			} else {
+				serviceLogs, _ = sshRun(client, "sudo cat /var/log/system.log | grep limguard | tail -50 2>&1")
+			}
+			log.Error("wait for pubkey", "node", name, "error", err, "serviceLogs", serviceLogs)
 			os.Exit(1)
 		}
 		publicKeys[name] = pubKey
@@ -339,12 +350,12 @@ func cmdDeploy(args []string) {
 	}
 	log.Info("updated local config with public keys")
 
-	// Pass 2: Distribute config and start daemons
-	log.Info("pass 2: distributing config and starting daemons")
+	// Pass 2: Distribute full config and restart services
+	log.Info("pass 2: distributing full config")
 	cfgYAML := mustMarshal(cfg)
 
 	for name, node := range cfg.Nodes {
-		log.Info("configuring", "node", name)
+		log.Info("updating config", "node", name)
 
 		client, err := sshConnect(node.SSH, *sshKey)
 		if err != nil {
@@ -352,21 +363,23 @@ func cmdDeploy(args []string) {
 			os.Exit(1)
 		}
 
+		osName, _ := detectPlatform(client)
+
 		// Write final config
 		tmpCfg := "/tmp/limguard.yaml"
 		writeRemoteFile(client, tmpCfg, cfgYAML)
-		sshRun(client, fmt.Sprintf("mv %s %s", tmpCfg, config.DefaultConfigPath))
+		sshRun(client, fmt.Sprintf("sudo mv %s %s", tmpCfg, config.DefaultConfigPath))
 
-		// Install and start service
-		osName, _ := detectPlatform(client)
+		// Restart service to pick up new config (mv replaces inode, fsnotify may miss it)
 		if osName == "linux" {
-			installLinuxService(client, cfg, name)
+			sshRun(client, "sudo systemctl restart limguard")
 		} else {
-			installDarwinService(client, cfg, name)
+			plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
+			sshRun(client, fmt.Sprintf("sudo launchctl unload %s && sudo launchctl load %s", plistPath, plistPath))
 		}
 
 		client.Close()
-		log.Info("started", "node", name)
+		log.Info("configured", "node", name)
 	}
 
 	log.Info("deployment complete")
@@ -377,6 +390,9 @@ func cmdDeploy(args []string) {
 func sshConnect(s *config.SSH, keyPath string) (*ssh.Client, error) {
 	authMethods := []ssh.AuthMethod{}
 
+	// Get home directory early for path expansion
+	home, _ := os.UserHomeDir()
+
 	// SSH agent
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
 		if conn, err := net.Dial("unix", sock); err == nil {
@@ -384,7 +400,7 @@ func sshConnect(s *config.SSH, keyPath string) (*ssh.Client, error) {
 		}
 	}
 
-	// Explicit key
+	// Explicit key from command line
 	if keyPath != "" {
 		if key, err := os.ReadFile(keyPath); err == nil {
 			if signer, err := ssh.ParsePrivateKey(key); err == nil {
@@ -392,8 +408,14 @@ func sshConnect(s *config.SSH, keyPath string) (*ssh.Client, error) {
 			}
 		}
 	}
+
+	// Identity file from config (expand ~ to home directory)
 	if s.IdentityFile != "" {
-		if key, err := os.ReadFile(s.IdentityFile); err == nil {
+		identityPath := s.IdentityFile
+		if strings.HasPrefix(identityPath, "~/") {
+			identityPath = filepath.Join(home, identityPath[2:])
+		}
+		if key, err := os.ReadFile(identityPath); err == nil {
 			if signer, err := ssh.ParsePrivateKey(key); err == nil {
 				authMethods = append(authMethods, ssh.PublicKeys(signer))
 			}
@@ -401,9 +423,10 @@ func sshConnect(s *config.SSH, keyPath string) (*ssh.Client, error) {
 	}
 
 	// Default keys
-	if home, _ := os.UserHomeDir(); home != "" {
+	if home != "" {
 		for _, name := range []string{"id_ed25519", "id_rsa"} {
-			if key, err := os.ReadFile(filepath.Join(home, ".ssh", name)); err == nil {
+			keyPath := filepath.Join(home, ".ssh", name)
+			if key, err := os.ReadFile(keyPath); err == nil {
 				if signer, err := ssh.ParsePrivateKey(key); err == nil {
 					authMethods = append(authMethods, ssh.PublicKeys(signer))
 				}
@@ -436,6 +459,17 @@ func sshRun(client *ssh.Client, cmd string) (string, error) {
 	return stdout.String(), nil
 }
 
+func waitForPubkey(client *ssh.Client, path string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if out, err := sshRun(client, fmt.Sprintf("cat %s 2>/dev/null", path)); err == nil && strings.TrimSpace(out) != "" {
+			return strings.TrimSpace(out), nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return "", fmt.Errorf("timeout waiting for %s", path)
+}
+
 func detectPlatform(client *ssh.Client) (string, string) {
 	osOut, _ := sshRun(client, "uname -s")
 	archOut, _ := sshRun(client, "uname -m")
@@ -448,6 +482,15 @@ func detectPlatform(client *ssh.Client) (string, string) {
 		arch = "arm64"
 	}
 	return osName, arch
+}
+
+func fileSHA256(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:]), nil
 }
 
 func writeRemoteFile(client *ssh.Client, path string, data []byte) error {
@@ -485,7 +528,7 @@ Before=kubelet.service
 
 [Service]
 Type=simple
-ExecStartPre=/sbin/modprobe wireguard || true
+ExecStartPre=-/sbin/modprobe wireguard
 ExecStart=%s run --config %s --node-name %s
 Restart=always
 RestartSec=5
@@ -504,10 +547,12 @@ SyslogIdentifier=limguard
 WantedBy=multi-user.target
 `, cfg.BinaryPath, config.DefaultConfigPath, nodeName)
 
-	writeRemoteFile(client, "/etc/systemd/system/limguard.service", []byte(service))
-	sshRun(client, "systemctl daemon-reload")
-	sshRun(client, "systemctl enable limguard")
-	sshRun(client, "systemctl restart limguard")
+	tmpService := "/tmp/limguard.service"
+	writeRemoteFile(client, tmpService, []byte(service))
+	sshRun(client, fmt.Sprintf("sudo mv %s /etc/systemd/system/limguard.service", tmpService))
+	sshRun(client, "sudo systemctl daemon-reload")
+	sshRun(client, "sudo systemctl enable limguard")
+	sshRun(client, "sudo systemctl restart limguard")
 }
 
 func installDarwinService(client *ssh.Client, cfg *config.Config, nodeName string) {
@@ -535,9 +580,11 @@ func installDarwinService(client *ssh.Client, cfg *config.Config, nodeName strin
 `, cfg.BinaryPath, config.DefaultConfigPath, nodeName)
 
 	plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
-	sshRun(client, fmt.Sprintf("launchctl unload %s 2>/dev/null || true", plistPath))
-	writeRemoteFile(client, plistPath, []byte(plist))
-	sshRun(client, fmt.Sprintf("launchctl load %s", plistPath))
+	tmpPlist := "/tmp/com.limrun.limguard.plist"
+	sshRun(client, fmt.Sprintf("sudo launchctl unload %s 2>/dev/null || true", plistPath))
+	writeRemoteFile(client, tmpPlist, []byte(plist))
+	sshRun(client, fmt.Sprintf("sudo mv %s %s", tmpPlist, plistPath))
+	sshRun(client, fmt.Sprintf("sudo launchctl load %s", plistPath))
 }
 
 func mustMarshal(cfg *config.Config) []byte {
@@ -552,14 +599,6 @@ func newLogger(debug bool) *slog.Logger {
 		level = slog.LevelDebug
 	}
 	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
-}
-
-func newLoggerStderr(debug bool) *slog.Logger {
-	level := slog.LevelInfo
-	if debug {
-		level = slog.LevelDebug
-	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 }
 
 // truncateKey returns a truncated version of a public key for logging.

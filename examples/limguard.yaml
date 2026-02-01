@@ -1,43 +1,30 @@
-# limguard configuration
-# Same file is used for deployment (with SSH info) and runtime (on all nodes)
-
-# Optional settings (shown with defaults)
-interfaceName: wg0           # wg0 on Linux, utun5 on macOS
+interfaceName: wg0
 listenPort: 51820
 privateKeyPath: /etc/limguard/privatekey
 binaryPath: /usr/local/bin/limguard
-
-# Required for deploy command: local directory with binaries
-# Binaries should be named: limguard-linux-amd64, limguard-linux-arm64, limguard-darwin-arm64
 artifactDir: ./dist
-
-# All nodes in the mesh
 nodes:
-  # Linux node
-  node-1:
-    wireguardIP: "10.200.0.1"
-    endpoint: "203.0.113.10"
-    publicKey: ""  # Filled in by deploy command
-    ssh:
-      host: "203.0.113.10"
-      port: 22
-      user: root
-      # identityFile: ~/.ssh/mykey  # Optional
-
-  # Another Linux node
-  node-2:
-    wireguardIP: "10.200.0.2"
-    endpoint: "203.0.113.11"
-    publicKey: ""
-    ssh:
-      host: "203.0.113.11"
-      user: root
-
-  # macOS workstation
-  mac-workstation:
-    wireguardIP: "10.200.0.100"
-    endpoint: "192.168.1.50"
-    publicKey: ""
-    ssh:
-      host: "192.168.1.50"
-      user: admin
+    node-1:
+        wireguardIP: 10.200.0.1
+        endpoint: 192.168.104.1
+        ssh:
+            host: 127.0.0.1
+            port: 55743
+            user: muvaf
+            identityFile: ~/.ssh/id_ed25519
+    node-2:
+        wireguardIP: 10.200.0.2
+        endpoint: 192.168.104.3
+        ssh:
+            host: 127.0.0.1
+            port: 55764
+            user: muvaf
+            identityFile: ~/.ssh/id_ed25519
+    node-3:
+        wireguardIP: 10.200.0.3
+        endpoint: 192.168.104.4
+        ssh:
+            host: 127.0.0.1
+            port: 55928
+            user: muvaf
+            identityFile: ~/.ssh/id_ed25519

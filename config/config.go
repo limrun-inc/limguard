@@ -93,7 +93,8 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// Validate checks the config for runtime use (requires public keys).
+// Validate checks the config for runtime use.
+// Empty publicKeys are allowed (used during bootstrap for self node).
 func (c *Config) Validate() error {
 	if len(c.Nodes) == 0 {
 		return fmt.Errorf("no nodes defined")
@@ -113,11 +114,12 @@ func (c *Config) Validate() error {
 		if node.Endpoint == "" {
 			return fmt.Errorf("node %q: endpoint required", name)
 		}
-		if node.PublicKey == "" {
-			return fmt.Errorf("node %q: publicKey required (run deploy first)", name)
-		}
-		if _, err := wgtypes.ParseKey(node.PublicKey); err != nil {
-			return fmt.Errorf("node %q: invalid publicKey: %w", name, err)
+		// Skip publicKey validation if empty (bootstrap mode for self node)
+		// Non-empty publicKeys must be valid
+		if node.PublicKey != "" {
+			if _, err := wgtypes.ParseKey(node.PublicKey); err != nil {
+				return fmt.Errorf("node %q: invalid publicKey: %w", name, err)
+			}
 		}
 	}
 	return nil
