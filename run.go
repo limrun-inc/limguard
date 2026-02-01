@@ -47,6 +47,12 @@ func Run(ctx context.Context, args []string, log *slog.Logger) error {
 		return fmt.Errorf("node %q not in config", name)
 	}
 
+	// If this node is marked for deletion, log and exit gracefully
+	if self.IsDelete() {
+		log.Info("node marked for deletion, exiting", "node", name)
+		return nil
+	}
+
 	// Bootstrap: ensure private key exists (generate if needed)
 	privateKey, err := EnsurePrivateKey(DefaultPrivateKeyPath)
 	if err != nil {

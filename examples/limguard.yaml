@@ -8,6 +8,7 @@ darwinInterfaceName: utun9  # Used on macOS nodes (must be utun[0-9]+)
 
 nodes:
     node-1:
+        # action: Apply              # Optional: Apply (default) or Delete
         wireguardIP: 10.200.0.1
         endpoint: 192.168.104.1:51820  # Must be host:port format
         # localBinaryPath: /path/to/limguard  # Optional: use local binary instead of downloading
@@ -24,6 +25,14 @@ nodes:
             port: 56641
             user: muvaf
             identityFile: ~/.ssh/id_ed25519
+    # Example: removing a node from the mesh (stops service, removes config/keys):
+    # old-node:
+    #     action: Delete
+    #     wireguardIP: 10.200.0.99
+    #     endpoint: 192.168.104.99:51820
+    #     ssh:
+    #         host: 192.168.104.99
+    #
     # Example local node (uncomment to join mesh from this machine):
     # ops-laptop:
     #     wireguardIP: 10.200.0.50

@@ -128,7 +128,7 @@ create_vm() {
     else
         log "Creating VM $name..."
         limactl_cmd create --name="$name" \
-            template://ubuntu-lts \
+            template:debian-13 \
             --cpus=1 \
             --memory=1 \
             --vm-type=vz \
@@ -270,31 +270,6 @@ run_apply() {
     go run ./cmd/limguard/ apply --config "$TMPDIR/limguard.yaml"
 }
 
-# Verify ping between nodes
-verify_ping() {
-    local from=$1
-    local to_ip=$2
-    
-    log "Pinging $to_ip from $from..."
-    for i in {1..5}; do
-        if [[ "$from" == "$LOCAL_NODE" ]]; then
-            if ping -c 3 -W 2 "$to_ip"; then
-                log "Ping from $from to $to_ip succeeded"
-                return 0
-            fi
-        else
-            if limactl_cmd shell "$from" -- ping -c 3 -W 2 "$to_ip"; then
-                log "Ping from $from to $to_ip succeeded"
-                return 0
-            fi
-        fi
-        warn "Ping attempt $i failed, retrying..."
-        sleep 2
-    done
-    error "Ping from $from to $to_ip failed after 5 attempts"
-    return 1
-}
-
 # Check service status
 check_service() {
     local name=$1
@@ -367,19 +342,7 @@ main() {
     # Step 6: Run apply (uses local binaries)
     run_apply
     
-    # Wait for services to stabilize
-    log "Waiting for services to stabilize..."
-    sleep 5
-    
-    # Step 7: Verify mesh
-    verify_ping "$NODE1" "$WG_IP2"
-    verify_ping "$NODE2" "$WG_IP1"
-    verify_ping "$LOCAL_NODE" "$WG_IP1"
-    verify_ping "$LOCAL_NODE" "$WG_IP2"
-    verify_ping "$NODE1" "$WG_IP_LOCAL"
-    verify_ping "$NODE2" "$WG_IP_LOCAL"
-    
-    # Step 8: Check services
+    # Step 7: Check services
     check_service "$NODE1"
     check_service "$NODE2"
     check_service "$LOCAL_NODE"

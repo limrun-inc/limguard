@@ -37,14 +37,30 @@ type SSH struct {
 	IdentityFile string `yaml:"identityFile,omitempty"`
 }
 
+// NodeAction represents the desired action for a node.
+type NodeAction string
+
+const (
+	// NodeActionApply is the default action - ensure the node is configured and running.
+	NodeActionApply NodeAction = "Apply"
+	// NodeActionDelete removes the node from peers and stops/uninstalls the service.
+	NodeActionDelete NodeAction = "Delete"
+)
+
 // Node represents a node in the WireGuard mesh.
 type Node struct {
-	WireguardIP     string `yaml:"wireguardIP"`
-	Endpoint        string `yaml:"endpoint"`                 // Must be host:port format
-	PublicKey       string `yaml:"publicKey,omitempty"`       // Filled in after bootstrap
-	InterfaceName   string `yaml:"interfaceName,omitempty"`   // Per-node override
-	LocalBinaryPath string `yaml:"localBinaryPath,omitempty"` // Local binary to use instead of downloading
-	SSH             *SSH   `yaml:"ssh,omitempty"`             // Used only by deploy command
+	Action          NodeAction `yaml:"action,omitempty"`          // Apply (default) or Delete
+	WireguardIP     string     `yaml:"wireguardIP"`
+	Endpoint        string     `yaml:"endpoint"`                  // Must be host:port format
+	PublicKey       string     `yaml:"publicKey,omitempty"`       // Filled in after bootstrap
+	InterfaceName   string     `yaml:"interfaceName,omitempty"`   // Per-node override
+	LocalBinaryPath string     `yaml:"localBinaryPath,omitempty"` // Local binary to use instead of downloading
+	SSH             *SSH       `yaml:"ssh,omitempty"`             // Used only by deploy command
+}
+
+// IsDelete returns true if the node is marked for deletion.
+func (n Node) IsDelete() bool {
+	return n.Action == NodeActionDelete
 }
 
 // Config is the unified configuration for limguard.
@@ -174,11 +190,11 @@ func (c *Config) GetSelf(name string) (Node, bool) {
 	return node, ok
 }
 
-// GetPeers returns all nodes except the given name.
+// GetPeers returns all nodes except the given name, excluding nodes marked for deletion.
 func (c *Config) GetPeers(selfName string) map[string]Node {
 	peers := make(map[string]Node)
 	for name, node := range c.Nodes {
-		if name != selfName {
+		if name != selfName && !node.IsDelete() {
 			peers[name] = node
 		}
 	}

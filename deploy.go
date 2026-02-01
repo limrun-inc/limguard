@@ -207,7 +207,7 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 		log.Info("all nodes have localBinaryPath set, skipping download")
 	}
 
-	// Pass 1: Bootstrap each node (in parallel)
+	// Pass 1: Bootstrap each node (in parallel), handle deletions
 	log.Info("pass 1: bootstrapping nodes")
 	publicKeys := make(map[string]string)
 	var pkMu sync.Mutex
@@ -218,6 +218,16 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 		nc := clients[name]
 
 		g.Go(func() error {
+			// Handle node deletion
+			if node.IsDelete() {
+				log.Info("deleting node", "node", name)
+				ifaceName := cfg.InterfaceName(name)
+				if err := uninstallNode(nc, name, ifaceName, log); err != nil {
+					return fmt.Errorf("uninstall node %s: %w", name, err)
+				}
+				return nil
+			}
+
 			log.Info("bootstrapping", "node", name)
 
 			// Use localBinaryPath if set, otherwise use downloaded binary
@@ -366,6 +376,7 @@ mv %s %s
 	// Pass 2: Distribute full config (in parallel)
 	// If service is running, limguard will pick up the config change via file watcher.
 	// If not running, start the service.
+	// Skip nodes marked for deletion (already uninstalled in pass 1).
 	log.Info("pass 2: distributing full config")
 	cfgYAML, err := cfg.ToYAML()
 	if err != nil {
@@ -375,7 +386,13 @@ mv %s %s
 	g2, _ := errgroup.WithContext(ctx)
 	for name := range cfg.Nodes {
 		name := name // capture loop variable
+		node := cfg.Nodes[name]
 		nc := clients[name]
+
+		// Skip deleted nodes
+		if node.IsDelete() {
+			continue
+		}
 
 		g2.Go(func() error {
 			log.Info("updating config", "node", name)
@@ -448,6 +465,7 @@ fi
 	}
 
 	// Pass 3: Validate mesh connectivity (in parallel)
+	// Skip nodes marked for deletion.
 	log.Info("pass 3: validating mesh connectivity")
 
 	// Wait for config to be picked up by file watcher
@@ -456,14 +474,23 @@ fi
 	g3, _ := errgroup.WithContext(ctx)
 	for name := range cfg.Nodes {
 		name := name // capture loop variable
-		nc := clients[name]
 		node := cfg.Nodes[name]
 
+		// Skip deleted nodes
+		if node.IsDelete() {
+			continue
+		}
+
+		nc := clients[name]
+
 		g3.Go(func() error {
-			// Ping all peers from this node
+			// Ping all peers from this node (skip deleted peers)
 			for peerName, peer := range cfg.Nodes {
 				if peerName == name {
 					continue // skip self
+				}
+				if peer.IsDelete() {
+					continue // skip deleted peers
 				}
 
 				// Ping peer's WireGuard IP
@@ -989,6 +1016,50 @@ func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot
 // isLocalNode returns true if the node is marked as local (ssh.host: self).
 func isLocalNode(node Node) bool {
 	return node.SSH != nil && strings.EqualFold(node.SSH.Host, "self")
+}
+
+// uninstallNode stops and removes the limguard service from a node.
+func uninstallNode(nc *nodeConn, nodeName, ifaceName string, log *slog.Logger) error {
+	var uninstallScript string
+	if nc.osName == "linux" {
+		uninstallScript = fmt.Sprintf(`
+systemctl stop limguard 2>/dev/null || true
+systemctl disable limguard 2>/dev/null || true
+rm -f /etc/systemd/system/limguard.service
+systemctl daemon-reload
+ip link delete %s 2>/dev/null || true
+rm -f /etc/limguard/limguard.yaml /etc/limguard/privatekey /etc/limguard/privatekey.pub
+rmdir /etc/limguard 2>/dev/null || true
+echo "UNINSTALLED"
+`, ifaceName)
+	} else {
+		// macOS
+		// Note: utun interfaces are owned by wireguard-go; killing it removes the interface
+		uninstallScript = fmt.Sprintf(`
+launchctl unload /Library/LaunchDaemons/com.limrun.limguard.plist 2>/dev/null || true
+rm -f /Library/LaunchDaemons/com.limrun.limguard.plist
+pkill -f "wireguard-go %s" 2>/dev/null || true
+rm -f /etc/limguard/limguard.yaml /etc/limguard/privatekey /etc/limguard/privatekey.pub
+rmdir /etc/limguard 2>/dev/null || true
+echo "UNINSTALLED"
+`, ifaceName)
+	}
+
+	var out string
+	var err error
+	if nc.local {
+		out, err = localRunAsRoot(uninstallScript)
+	} else {
+		out, err = runAsRoot(nc.ssh, nc.isRoot, uninstallScript)
+	}
+	if err != nil {
+		return fmt.Errorf("uninstall script failed: %w", err)
+	}
+
+	if strings.TrimSpace(out) == "UNINSTALLED" {
+		log.Info("node uninstalled", "node", nodeName)
+	}
+	return nil
 }
 
 // localRunAsRoot runs a shell script locally as root.
