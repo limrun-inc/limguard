@@ -27,11 +27,21 @@ type NetworkManager struct {
 	peers    map[string]string // wireguardIP -> publicKey
 	mu       sync.RWMutex
 	log      *slog.Logger
-	done     chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 // NewNetworkManager creates the WireGuard interface and configures it.
 func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP string, log *slog.Logger) (*NetworkManager, error) {
+	// Create a context for background operations
+	ctx, cancel := context.WithCancel(context.Background())
+	success := false
+	defer func() {
+		if !success {
+			cancel()
+		}
+	}()
+
 	link, err := netlink.LinkByName(iface)
 	if err != nil {
 		wgLink := &netlink.Wireguard{LinkAttrs: netlink.LinkAttrs{Name: iface}}
@@ -87,16 +97,18 @@ func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP
 		link:     link,
 		peers:    make(map[string]string),
 		log:      log,
-		done:     make(chan struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 
 	go nm.syncAllowedIPsLoop()
+	success = true
 	return nm, nil
 }
 
 // Close stops the NetworkManager and releases resources.
 func (nm *NetworkManager) Close() error {
-	close(nm.done)
+	nm.cancel()
 	return nm.wgClient.Close()
 }
 
@@ -124,11 +136,20 @@ func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wire
 		// Resolve endpoint if provided (empty for NAT'd peers that initiate connections)
 		var udpAddr *net.UDPAddr
 		if endpoint != "" {
-			var err error
-			udpAddr, err = net.ResolveUDPAddr("udp", endpoint)
+			host, port, err := net.SplitHostPort(endpoint)
 			if err != nil {
-				return fmt.Errorf("resolve endpoint: %w", err)
+				return fmt.Errorf("parse endpoint: %w", err)
 			}
+			// Use context-aware DNS resolution
+			ips, err := net.DefaultResolver.LookupHost(ctx, host)
+			if err != nil {
+				return fmt.Errorf("resolve endpoint host: %w", err)
+			}
+			if len(ips) == 0 {
+				return fmt.Errorf("no addresses found for %s", host)
+			}
+			portNum, _ := net.LookupPort("udp", port)
+			udpAddr = &net.UDPAddr{IP: net.ParseIP(ips[0]), Port: portNum}
 		}
 		_, allowedIP, _ := net.ParseCIDR(wireguardIP + "/32")
 		keepalive := 25 * time.Second
@@ -218,7 +239,7 @@ func (nm *NetworkManager) syncAllowedIPsLoop() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-nm.done:
+		case <-nm.ctx.Done():
 			return
 		case <-ticker.C:
 			nm.syncAllowedIPs()

@@ -163,7 +163,7 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 		// Resolve version if not specified
 		if cfg.Version == "" {
 			log.Info("resolving latest release version")
-			version, err := downloader.ResolveLatestVersion()
+			version, err := downloader.ResolveLatestVersion(ctx)
 			if err != nil {
 				return fmt.Errorf("resolve latest version: %w", err)
 			}
@@ -181,7 +181,7 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 
 		log.Info("downloading binaries from GitHub releases", "version", cfg.Version)
 
-		gDownload, _ := errgroup.WithContext(ctx)
+		gDownload, gDownloadCtx := errgroup.WithContext(ctx)
 		for platform := range platformsNeedDownload {
 			platform := platform // capture
 			parts := strings.SplitN(platform, "-", 2)
@@ -189,7 +189,7 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 
 			gDownload.Go(func() error {
 				log.Info("downloading binary", "platform", platform)
-				path, err := downloader.DownloadBinary(cfg.Version, osName, arch)
+				path, err := downloader.DownloadBinary(gDownloadCtx, cfg.Version, osName, arch)
 				if err != nil {
 					return fmt.Errorf("download binary for %s: %w", platform, err)
 				}
@@ -215,17 +215,21 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 	var pkMu sync.Mutex
 	var localPrivateKey string // Store the private key for local node's WireGuard config
 
-	g, _ := errgroup.WithContext(ctx)
+	g, gCtx := errgroup.WithContext(ctx)
 	for name, node := range cfg.Nodes {
 		name, node := name, node // capture loop variables
 		nc := clients[name]
 
 		g.Go(func() error {
+			// Check for cancellation
+			if gCtx.Err() != nil {
+				return gCtx.Err()
+			}
 			// Handle node deletion
 			if node.IsDelete() {
 				log.Info("deleting node", "node", name)
 				ifaceName := cfg.InterfaceName(name)
-				if err := uninstallNode(nc, name, ifaceName, log); err != nil {
+				if err := uninstallNode(gCtx, nc, name, ifaceName, log); err != nil {
 					return fmt.Errorf("uninstall node %s: %w", name, err)
 				}
 				return nil
@@ -335,7 +339,7 @@ mv %s %s
 
 			// Poll for pubkey file (written by limguard run on startup)
 			pubkeyPath := DefaultPrivateKeyPath + ".pub"
-			pubKey, err := waitForPubkey(nc.ssh, nc.sftp, nc.isRoot, pubkeyPath, 3*time.Second)
+			pubKey, err := waitForPubkey(gCtx, nc.ssh, nc.sftp, nc.isRoot, pubkeyPath, 3*time.Second)
 			if err != nil {
 				// Fetch service logs to show what went wrong
 				var serviceLogs string
@@ -384,7 +388,7 @@ mv %s %s
 		return fmt.Errorf("marshal final config: %w", err)
 	}
 
-	g2, _ := errgroup.WithContext(ctx)
+	g2, g2Ctx := errgroup.WithContext(ctx)
 	for name := range cfg.Nodes {
 		name := name // capture loop variable
 		node := cfg.Nodes[name]
@@ -396,6 +400,10 @@ mv %s %s
 		}
 
 		g2.Go(func() error {
+			// Check for cancellation
+			if g2Ctx.Err() != nil {
+				return g2Ctx.Err()
+			}
 			log.Info("updating config", "node", name)
 
 			// Write final config
@@ -455,10 +463,14 @@ fi
 	// Skip nodes marked for deletion and local nodes (not connected yet).
 	log.Info("pass 3: validating mesh connectivity")
 
-	// Wait for config to be picked up by file watcher
-	time.Sleep(2 * time.Second)
+	// Wait for config to be picked up by file watcher (cancellable)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(2 * time.Second):
+	}
 
-	g3, _ := errgroup.WithContext(ctx)
+	g3, g3Ctx := errgroup.WithContext(ctx)
 	for name := range cfg.Nodes {
 		name := name // capture loop variable
 		node := cfg.Nodes[name]
@@ -470,6 +482,10 @@ fi
 		}
 
 		g3.Go(func() error {
+			// Check for cancellation
+			if g3Ctx.Err() != nil {
+				return g3Ctx.Err()
+			}
 			// Ping all remote peers from this node (skip deleted peers and local peers)
 			for peerName, peer := range cfg.Nodes {
 				if peerName == name {
@@ -778,9 +794,13 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 	return sb.String()
 }
 
-func waitForPubkey(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, path string, timeout time.Duration) (string, error) {
+func waitForPubkey(ctx context.Context, sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, path string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		// Check for cancellation
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		// Try SFTP first (works if file is readable by ssh user)
 		if data, err := sftpReadFile(sftpClient, path); err == nil && len(data) > 0 {
 			return strings.TrimSpace(string(data)), nil
@@ -789,7 +809,11 @@ func waitForPubkey(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, 
 		if out, err := runAsRoot(sshClient, isRoot, fmt.Sprintf("cat %q 2>/dev/null", path)); err == nil && strings.TrimSpace(out) != "" {
 			return strings.TrimSpace(out), nil
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 	return "", fmt.Errorf("timeout waiting for %s", path)
 }
@@ -985,7 +1009,7 @@ func isLocalNode(node Node) bool {
 }
 
 // uninstallNode stops and removes the limguard service from a node.
-func uninstallNode(nc *nodeConn, nodeName, ifaceName string, log *slog.Logger) error {
+func uninstallNode(ctx context.Context, nc *nodeConn, nodeName, ifaceName string, log *slog.Logger) error {
 	var uninstallScript string
 	if nc.osName == "linux" {
 		uninstallScript = fmt.Sprintf(`
@@ -1014,7 +1038,7 @@ echo "UNINSTALLED"
 	var out string
 	var err error
 	if nc.local {
-		out, err = localRunAsRoot(uninstallScript)
+		out, err = localRunAsRoot(ctx, uninstallScript)
 	} else {
 		out, err = runAsRoot(nc.ssh, nc.isRoot, uninstallScript)
 	}
@@ -1030,12 +1054,12 @@ echo "UNINSTALLED"
 
 // localRunAsRoot runs a shell script locally as root.
 // If already root, runs directly; otherwise uses sudo.
-func localRunAsRoot(script string) (string, error) {
+func localRunAsRoot(ctx context.Context, script string) (string, error) {
 	var cmd *exec.Cmd
 	if os.Geteuid() == 0 {
-		cmd = exec.Command("sh", "-s")
+		cmd = exec.CommandContext(ctx, "sh", "-s")
 	} else {
-		cmd = exec.Command("sudo", "sh", "-s")
+		cmd = exec.CommandContext(ctx, "sudo", "sh", "-s")
 	}
 
 	var stdout, stderr bytes.Buffer

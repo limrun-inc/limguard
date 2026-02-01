@@ -27,7 +27,8 @@ type NetworkManager struct {
 	peers    map[string]string // wireguardIP -> publicKey
 	mu       sync.RWMutex
 	log      *slog.Logger
-	done     chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 // NewNetworkManager creates the WireGuard interface and configures it.
@@ -37,21 +38,37 @@ func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP
 		return nil, fmt.Errorf("macOS interface name must start with 'utun' (e.g., utun9), got: %s", iface)
 	}
 
+	// Create a context for background operations
+	ctx, cancel := context.WithCancel(context.Background())
+	success := false
+	defer func() {
+		if !success {
+			cancel()
+		}
+	}()
+
 	// Create interface if needed
-	if _, err := exec.Command("ifconfig", iface).Output(); err != nil {
-		out, err := exec.Command("/opt/homebrew/bin/wireguard-go", iface).CombinedOutput()
+	if _, err := exec.CommandContext(ctx, "ifconfig", iface).Output(); err != nil {
+		out, err := exec.CommandContext(ctx, "/opt/homebrew/bin/wireguard-go", iface).CombinedOutput()
 		if err != nil {
 			return nil, fmt.Errorf("create interface: %s: %w", out, err)
 		}
 
-		// Wait for interface to become available
+		// Wait for interface to become available (cancellable)
 		available := false
 		for i := 0; i < 20; i++ {
-			if _, err := exec.Command("ifconfig", iface).Output(); err == nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if _, err := exec.CommandContext(ctx, "ifconfig", iface).Output(); err == nil {
 				available = true
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 		if !available {
 			return nil, fmt.Errorf("interface %s not available after wireguard-go started", iface)
@@ -60,7 +77,7 @@ func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP
 	}
 
 	// Add IP address
-	if out, err := exec.Command("ifconfig", iface, "inet", wireguardIP+"/32", wireguardIP, "alias").CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "ifconfig", iface, "inet", wireguardIP+"/32", wireguardIP, "alias").CombinedOutput(); err != nil {
 		outStr := strings.ToLower(string(out))
 		if !strings.Contains(outStr, "exists") && !strings.Contains(outStr, "already") {
 			return nil, fmt.Errorf("set address: %s: %w", out, err)
@@ -91,12 +108,12 @@ func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP
 	}
 
 	// Set MTU
-	if err := setMTU(iface); err != nil {
+	if err := setMTU(ctx, iface); err != nil {
 		wgClient.Close()
 		return nil, fmt.Errorf("set MTU: %w", err)
 	}
 
-	if out, err := exec.Command("ifconfig", iface, "up").CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "ifconfig", iface, "up").CombinedOutput(); err != nil {
 		wgClient.Close()
 		return nil, fmt.Errorf("bring interface up: %s: %w", out, err)
 	}
@@ -107,16 +124,18 @@ func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP
 		wgClient: wgClient,
 		peers:    make(map[string]string),
 		log:      log,
-		done:     make(chan struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 
 	go nm.syncAllowedIPsLoop()
+	success = true
 	return nm, nil
 }
 
 // Close stops the NetworkManager and releases resources.
 func (nm *NetworkManager) Close() error {
-	close(nm.done)
+	nm.cancel()
 	return nm.wgClient.Close()
 }
 
@@ -144,11 +163,20 @@ func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wire
 		// Resolve endpoint if provided (empty for NAT'd peers that initiate connections)
 		var udpAddr *net.UDPAddr
 		if endpoint != "" {
-			var err error
-			udpAddr, err = net.ResolveUDPAddr("udp", endpoint)
+			host, port, err := net.SplitHostPort(endpoint)
 			if err != nil {
-				return fmt.Errorf("resolve endpoint: %w", err)
+				return fmt.Errorf("parse endpoint: %w", err)
 			}
+			// Use context-aware DNS resolution
+			ips, err := net.DefaultResolver.LookupHost(ctx, host)
+			if err != nil {
+				return fmt.Errorf("resolve endpoint host: %w", err)
+			}
+			if len(ips) == 0 {
+				return fmt.Errorf("no addresses found for %s", host)
+			}
+			portNum, _ := net.LookupPort("udp", port)
+			udpAddr = &net.UDPAddr{IP: net.ParseIP(ips[0]), Port: portNum}
 		}
 		_, allowedIP, _ := net.ParseCIDR(wireguardIP + "/32")
 		keepalive := 25 * time.Second
@@ -172,9 +200,9 @@ func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wire
 
 	// Add route if needed
 	ifaceRe := regexp.MustCompile(`interface:\s*` + regexp.QuoteMeta(nm.iface) + `(\s|$)`)
-	out, err := exec.Command("route", "-n", "get", wireguardIP).CombinedOutput()
+	out, err := exec.CommandContext(ctx, "route", "-n", "get", wireguardIP).CombinedOutput()
 	if err != nil || !ifaceRe.Match(out) {
-		if routeOut, routeErr := exec.Command("route", "-n", "add", "-host", wireguardIP, "-interface", nm.iface).CombinedOutput(); routeErr != nil {
+		if routeOut, routeErr := exec.CommandContext(ctx, "route", "-n", "add", "-host", wireguardIP, "-interface", nm.iface).CombinedOutput(); routeErr != nil {
 			// Ignore "route already exists" errors - can happen due to race conditions
 			// between the check (route -n get) and add (route -n add). Unlike Linux's
 			// netlink.RouteReplace which is idempotent, macOS route add fails if the route exists.
@@ -207,7 +235,7 @@ func (nm *NetworkManager) RemovePeer(ctx context.Context, publicKey string) erro
 	nm.mu.Lock()
 	for ip, pk := range nm.peers {
 		if pk == publicKey {
-			if out, err := exec.Command("route", "-n", "delete", "-host", ip).CombinedOutput(); err != nil {
+			if out, err := exec.CommandContext(ctx, "route", "-n", "delete", "-host", ip).CombinedOutput(); err != nil {
 				nm.mu.Unlock()
 				return fmt.Errorf("delete route for %s: %s: %w", ip, out, err)
 			}
@@ -237,7 +265,7 @@ func (nm *NetworkManager) syncAllowedIPsLoop() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-nm.done:
+		case <-nm.ctx.Done():
 			return
 		case <-ticker.C:
 			nm.syncAllowedIPs()
@@ -246,7 +274,7 @@ func (nm *NetworkManager) syncAllowedIPsLoop() {
 }
 
 func (nm *NetworkManager) syncAllowedIPs() {
-	out, err := exec.Command("netstat", "-rn").Output()
+	out, err := exec.CommandContext(nm.ctx, "netstat", "-rn").Output()
 	if err != nil {
 		return
 	}
@@ -334,8 +362,8 @@ func expandCIDR(cidr string) string {
 	return ip + "/" + parts[1]
 }
 
-func setMTU(iface string) error {
-	out, err := exec.Command("netstat", "-nr", "-f", "inet").Output()
+func setMTU(ctx context.Context, iface string) error {
+	out, err := exec.CommandContext(ctx, "netstat", "-nr", "-f", "inet").Output()
 	if err != nil {
 		return err
 	}
@@ -351,7 +379,7 @@ func setMTU(iface string) error {
 		return fmt.Errorf("no default interface")
 	}
 
-	out, err = exec.Command("ifconfig", defaultIface).Output()
+	out, err = exec.CommandContext(ctx, "ifconfig", defaultIface).Output()
 	if err != nil {
 		return err
 	}
@@ -363,6 +391,6 @@ func setMTU(iface string) error {
 		}
 	}
 
-	_, err = exec.Command("ifconfig", iface, "mtu", strconv.Itoa(mtu-80)).CombinedOutput()
+	_, err = exec.CommandContext(ctx, "ifconfig", iface, "mtu", strconv.Itoa(mtu-80)).CombinedOutput()
 	return err
 }

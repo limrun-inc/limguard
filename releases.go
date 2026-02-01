@@ -2,6 +2,7 @@ package limguard
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // GitHubRepo is the repository to download releases from.
@@ -45,7 +47,9 @@ func NewReleaseDownloader() (*ReleaseDownloader, error) {
 	}
 	return &ReleaseDownloader{
 		cacheDir:  cacheDir,
-		client:    &http.Client{},
+		// Use a timeout so we don't hang forever on stalled downloads.
+		// Context cancellation (Ctrl+C) will still abort immediately.
+		client:    &http.Client{Timeout: 5 * time.Minute},
 		releases:  make(map[string]*releaseInfo),
 		checksums: make(map[string]map[string]string),
 	}, nil
@@ -57,9 +61,9 @@ func (d *ReleaseDownloader) Cleanup() {
 }
 
 // ResolveLatestVersion fetches the latest release tag from GitHub.
-func (d *ReleaseDownloader) ResolveLatestVersion() (string, error) {
+func (d *ReleaseDownloader) ResolveLatestVersion(ctx context.Context) (string, error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", GitHubRepo)
-	release, err := d.fetchRelease(url)
+	release, err := d.fetchRelease(ctx, url)
 	if err != nil {
 		return "", fmt.Errorf("fetch latest release: %w", err)
 	}
@@ -74,8 +78,8 @@ func (d *ReleaseDownloader) ResolveLatestVersion() (string, error) {
 // DownloadBinary downloads the binary for the given version, OS, and architecture.
 // Returns the local path to the downloaded binary.
 // The binary is cached locally and verified against SHA256 checksums from the release.
-func (d *ReleaseDownloader) DownloadBinary(version, osName, arch string) (string, error) {
-	release, err := d.getRelease(version)
+func (d *ReleaseDownloader) DownloadBinary(ctx context.Context, version, osName, arch string) (string, error) {
+	release, err := d.getRelease(ctx, version)
 	if err != nil {
 		return "", err
 	}
@@ -101,7 +105,7 @@ func (d *ReleaseDownloader) DownloadBinary(version, osName, arch string) (string
 	}
 
 	// Get expected checksum
-	checksums, err := d.getChecksums(version, release)
+	checksums, err := d.getChecksums(ctx, version, release)
 	if err != nil {
 		return "", fmt.Errorf("get checksums: %w", err)
 	}
@@ -116,7 +120,7 @@ func (d *ReleaseDownloader) DownloadBinary(version, osName, arch string) (string
 	}
 
 	// Download the asset
-	if err := d.downloadAsset(asset.BrowserDownloadURL, localPath); err != nil {
+	if err := d.downloadAsset(ctx, asset.BrowserDownloadURL, localPath); err != nil {
 		return "", fmt.Errorf("download asset %s: %w", assetName, err)
 	}
 
@@ -135,7 +139,7 @@ func (d *ReleaseDownloader) DownloadBinary(version, osName, arch string) (string
 }
 
 // getChecksums fetches and parses the checksums.txt file for a release.
-func (d *ReleaseDownloader) getChecksums(version string, release *releaseInfo) (map[string]string, error) {
+func (d *ReleaseDownloader) getChecksums(ctx context.Context, version string, release *releaseInfo) (map[string]string, error) {
 	d.mu.Lock()
 	if checksums, ok := d.checksums[version]; ok {
 		d.mu.Unlock()
@@ -160,7 +164,7 @@ func (d *ReleaseDownloader) getChecksums(version string, release *releaseInfo) (
 	if err := os.MkdirAll(filepath.Dir(checksumPath), 0755); err != nil {
 		return nil, fmt.Errorf("create cache subdir: %w", err)
 	}
-	if err := d.downloadAsset(checksumAsset.BrowserDownloadURL, checksumPath); err != nil {
+	if err := d.downloadAsset(ctx, checksumAsset.BrowserDownloadURL, checksumPath); err != nil {
 		return nil, fmt.Errorf("download checksums.txt: %w", err)
 	}
 
@@ -209,7 +213,7 @@ func parseChecksums(path string) (map[string]string, error) {
 	return checksums, nil
 }
 
-func (d *ReleaseDownloader) getRelease(version string) (*releaseInfo, error) {
+func (d *ReleaseDownloader) getRelease(ctx context.Context, version string) (*releaseInfo, error) {
 	d.mu.Lock()
 	if release, ok := d.releases[version]; ok {
 		d.mu.Unlock()
@@ -218,7 +222,7 @@ func (d *ReleaseDownloader) getRelease(version string) (*releaseInfo, error) {
 	d.mu.Unlock()
 
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", GitHubRepo, version)
-	release, err := d.fetchRelease(url)
+	release, err := d.fetchRelease(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf("fetch release %s: %w", version, err)
 	}
@@ -230,8 +234,8 @@ func (d *ReleaseDownloader) getRelease(version string) (*releaseInfo, error) {
 	return release, nil
 }
 
-func (d *ReleaseDownloader) fetchRelease(url string) (*releaseInfo, error) {
-	req, err := http.NewRequest("GET", url, nil)
+func (d *ReleaseDownloader) fetchRelease(ctx context.Context, url string) (*releaseInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -256,8 +260,8 @@ func (d *ReleaseDownloader) fetchRelease(url string) (*releaseInfo, error) {
 	return &release, nil
 }
 
-func (d *ReleaseDownloader) downloadAsset(url, destPath string) error {
-	req, err := http.NewRequest("GET", url, nil)
+func (d *ReleaseDownloader) downloadAsset(ctx context.Context, url, destPath string) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
 	}
