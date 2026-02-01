@@ -147,6 +147,12 @@ create_vm() {
 # Start a VM and wait for it to be ready
 start_vm() {
     local name=$1
+    local lima_dir
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        lima_dir=$(eval echo ~"$SUDO_USER")/.lima
+    else
+        lima_dir="$HOME/.lima"
+    fi
     
     log "Starting VM $name..."
     limactl_cmd start "$name" || true
@@ -159,7 +165,19 @@ start_vm() {
         fi
         sleep 1
     done
+    
     error "VM $name did not become ready"
+    error "=== Lima logs for $name ==="
+    if [[ -f "$lima_dir/$name/ha.stderr.log" ]]; then
+        error "--- ha.stderr.log ---"
+        cat "$lima_dir/$name/ha.stderr.log" >&2
+    fi
+    for serial_log in "$lima_dir/$name"/serial*.log; do
+        if [[ -f "$serial_log" ]]; then
+            error "--- $(basename "$serial_log") ---"
+            tail -100 "$serial_log" >&2
+        fi
+    done
     exit 1
 }
 
