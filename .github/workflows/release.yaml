@@ -13,7 +13,7 @@ env:
 
 jobs:
   test:
-    runs-on: macos-14  # M1 runner with Virtualization.framework support
+    runs-on: macos-26
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,9 +23,9 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Install Lima and socket_vmnet
+      - name: Install Lima, socket_vmnet, and WireGuard tools
         run: |
-          brew install lima socket_vmnet
+          brew install lima socket_vmnet wireguard-tools
 
       - name: Configure socket_vmnet
         run: |
@@ -57,9 +57,9 @@ jobs:
         run: |
           ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
 
-      - name: Run integration tests
+      - name: Run E2E tests
         run: |
-          sudo ./tests/integration-local.sh
+          sudo ./tests/e2e.sh
 
   release:
     needs: test

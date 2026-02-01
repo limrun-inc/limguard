@@ -47,11 +47,13 @@ Tests mesh connectivity between two Lima VMs:
 
 ### Integration Test with Local Node
 
-Tests mesh connectivity between two Lima VMs **and** your local machine. Requires root:
+Tests mesh connectivity between two Lima VMs and your local machine. Uses `wg-quick` to bring up the generated WireGuard config and ping peers:
 
 ```bash
 sudo ./integration-local.sh
 ```
+
+**Note:** Requires `wireguard-tools` (`brew install wireguard-tools`) and sudo for WireGuard operations.
 
 ## Options
 
@@ -62,8 +64,6 @@ CLEANUP=0 ./integration.sh
 sudo CLEANUP=0 ./integration-local.sh
 ```
 
-**Note:** For the local test, pass `CLEANUP=0` after `sudo`, not before.
-
 ## Manual Cleanup
 
 If tests fail or you used `CLEANUP=0`:
@@ -71,11 +71,4 @@ If tests fail or you used `CLEANUP=0`:
 ```bash
 # Delete test VMs
 limactl delete --force limguard-test-1 limguard-test-2
-limactl delete --force limguard-local-test-1 limguard-local-test-2
-
-# Remove local service (if integration-local.sh was run)
-sudo launchctl unload /Library/LaunchDaemons/com.limrun.limguard.plist 2>/dev/null
-sudo rm -f /Library/LaunchDaemons/com.limrun.limguard.plist
-sudo rm -f /var/log/limguard.log
-sudo rm -rf /usr/local/bin/limguard /etc/limguard
 ```

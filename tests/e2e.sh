@@ -1,14 +1,16 @@
 #!/bin/bash
-# Integration test: deploys limguard to two Lima VMs AND the local machine.
-# Usage: sudo CLEANUP=0 ./tests/integration-local.sh  # Keep VMs for debugging
-#        sudo ./tests/integration-local.sh            # Clean up after test
+# Integration test: deploys limguard to two Lima VMs and generates a WireGuard
+# client config for the local machine, then validates connectivity.
+# Usage: sudo ./tests/integration-local.sh              # Clean up after test
+#        sudo CLEANUP=0 ./tests/integration-local.sh    # Keep VMs for debugging
 #
 # Prerequisites:
 # - Lima (brew install lima)
 # - socket_vmnet (see tests/README.md for setup)
+# - WireGuard tools (brew install wireguard-tools)
 # - Go 1.24+
 # - SSH key (~/.ssh/id_ed25519 or ~/.ssh/id_rsa)
-# - Root privileges (sudo)
+# - sudo access (for wg-quick)
 
 set -euo pipefail
 
@@ -40,31 +42,25 @@ TMPDIR=$(mktemp -d)
 trap 'cleanup' EXIT
 
 cleanup() {
+    log "Cleaning up..."
+    # Bring down WireGuard interface if it's up
+    wg-quick down "$TMPDIR/$LOCAL_NODE-peer.conf" 2>/dev/null || true
+    
     if [[ "$CLEANUP" == "1" ]]; then
-        log "Cleaning up..."
-        log "Stopping local limguard service..."
-        launchctl bootout system/com.limrun.limguard 2>/dev/null || true
-        rm -f /Library/LaunchDaemons/com.limrun.limguard.plist
-        rm -f /var/log/limguard.log
-        
-        # Kill any wireguard-go processes for our interface
-        pkill -f "wireguard-go utun9" 2>/dev/null || true
-        rm -f /var/run/wireguard/utun9.sock 2>/dev/null || true
-        
         limactl_cmd stop "$NODE1" 2>/dev/null || true
         limactl_cmd stop "$NODE2" 2>/dev/null || true
         limactl_cmd delete "$NODE1" 2>/dev/null || true
         limactl_cmd delete "$NODE2" 2>/dev/null || true
         rm -rf "$TMPDIR"
     else
-        warn "Skipping cleanup (CLEANUP=0)"
+        warn "Skipping VM cleanup (CLEANUP=0)"
         warn "Temp dir: $TMPDIR"
         warn "VMs: $NODE1, $NODE2"
-        warn "Local service still installed"
+        warn "WireGuard config: $TMPDIR/$LOCAL_NODE-peer.conf"
     fi
 }
 
-# Run limactl as the original user (not root)
+# Run limactl as the original user (limactl refuses to run as root)
 limactl_cmd() {
     if [[ -n "${SUDO_USER:-}" ]]; then
         sudo -u "$SUDO_USER" limactl "$@"
@@ -77,9 +73,17 @@ limactl_cmd() {
 check_prerequisites() {
     log "Checking prerequisites..."
     
-    # Must be root
+    # Must be run as root (via sudo) for wg-quick
     if [[ $EUID -ne 0 ]]; then
-        error "This test must be run as root (sudo ./integration-local.sh)"
+        error "This test must be run as root for WireGuard operations."
+        error "Run with: sudo ./tests/integration-local.sh"
+        exit 1
+    fi
+    
+    # Need SUDO_USER to run limactl as the original user
+    if [[ -z "${SUDO_USER:-}" ]]; then
+        error "Please run with sudo (not as root directly)."
+        error "Run with: sudo ./tests/integration-local.sh"
         exit 1
     fi
     
@@ -93,6 +97,11 @@ check_prerequisites() {
         exit 1
     fi
     
+    if ! command -v wg-quick &>/dev/null; then
+        error "wg-quick not found. Install with: brew install wireguard-tools"
+        exit 1
+    fi
+    
     # Check socket_vmnet is running (required for shared network)
     if ! pgrep -x socket_vmnet &>/dev/null; then
         error "socket_vmnet not running. See tests/README.md for setup instructions."
@@ -100,12 +109,10 @@ check_prerequisites() {
     fi
     log "socket_vmnet is running"
     
-    # Find SSH key (check original user's home if running as sudo)
-    local user_home
+    # Find SSH key (use original user's home when running as sudo)
+    local user_home="$HOME"
     if [[ -n "${SUDO_USER:-}" ]]; then
         user_home=$(eval echo ~"$SUDO_USER")
-    else
-        user_home=$HOME
     fi
     
     if [[ -f "$user_home/.ssh/id_ed25519" ]]; then
@@ -164,13 +171,6 @@ get_vm_ip() {
     limactl_cmd shell "$name" -- ip addr show lima0 | grep 'inet ' | awk '{print $2}' | cut -d/ -f1
 }
 
-# Get local machine IP on the shared network
-get_local_ip() {
-    # The shared network uses 192.168.105.0/24, local host is typically .1
-    # But we need to find the actual interface
-    ifconfig | grep -A 5 "bridge100" | grep "inet " | awk '{print $2}' || echo "192.168.105.1"
-}
-
 # Enable SSH access
 enable_ssh_access() {
     local name=$1
@@ -187,9 +187,9 @@ enable_ssh_access() {
     "
 }
 
-# Build limguard binaries for Linux (VMs) and Darwin (local)
+# Build limguard binary for Linux (VMs only - local node uses WireGuard GUI)
 build_binaries() {
-    log "Building limguard binaries..."
+    log "Building limguard binary for Linux..."
     
     # Detect architecture
     local arch="arm64"
@@ -198,16 +198,11 @@ build_binaries() {
     fi
     
     LINUX_BINARY_PATH="$TMPDIR/limguard-linux-$arch"
-    DARWIN_BINARY_PATH="$TMPDIR/limguard-darwin-$arch"
     
-    log "Building $LINUX_BINARY_PATH..."
     cd "$PROJECT_ROOT"
     GOOS=linux GOARCH=$arch go build -o "$LINUX_BINARY_PATH" ./cmd/limguard/
     
-    log "Building $DARWIN_BINARY_PATH..."
-    GOOS=darwin GOARCH=$arch go build -o "$DARWIN_BINARY_PATH" ./cmd/limguard/
-    
-    log "Binaries built"
+    log "Binary built: $LINUX_BINARY_PATH"
 }
 
 # Create test config
@@ -216,9 +211,8 @@ create_config() {
     local ssh_port2=$2
     local endpoint1=$3
     local endpoint2=$4
-    local local_endpoint=$5
     local username
-    
+    # Use original user when running as sudo (VMs run as that user)
     if [[ -n "${SUDO_USER:-}" ]]; then
         username="$SUDO_USER"
     else
@@ -253,9 +247,6 @@ nodes:
 
   $LOCAL_NODE:
     wireguardIP: "$WG_IP_LOCAL"
-    endpoint: "$local_endpoint:51821"
-    interfaceName: utun9
-    localBinaryPath: "$DARWIN_BINARY_PATH"
     ssh:
       host: self
 EOF
@@ -267,33 +258,72 @@ EOF
 run_apply() {
     log "Running limguard apply..."
     cd "$PROJECT_ROOT"
-    go run ./cmd/limguard/ apply --config "$TMPDIR/limguard.yaml"
+    go run ./cmd/limguard/ apply --config "$TMPDIR/limguard.yaml" --local-wireguard-conf-path "$TMPDIR/$LOCAL_NODE-peer.conf"
 }
 
-# Check service status
+# Check service status on remote nodes
 check_service() {
     local name=$1
     
     log "Checking service status on $name..."
-    if [[ "$name" == "$LOCAL_NODE" ]]; then
-        if launchctl print system/com.limrun.limguard &>/dev/null; then
-            log "Service on $name is active"
-        else
-            error "Service on $name is not active"
-            cat /var/log/limguard.log 2>/dev/null | tail -20 || true
-            return 1
-        fi
+    local status
+    status=$(limactl_cmd shell "$name" -- sudo systemctl is-active limguard)
+    if [[ "$status" == "active" ]]; then
+        log "Service on $name is active"
     else
-        local status
-        status=$(limactl_cmd shell "$name" -- sudo systemctl is-active limguard)
-        if [[ "$status" == "active" ]]; then
-            log "Service on $name is active"
-        else
-            error "Service on $name is not active: $status"
-            limactl_cmd shell "$name" -- sudo journalctl -u limguard -n 20 --no-pager
-            return 1
-        fi
+        error "Service on $name is not active: $status"
+        limactl_cmd shell "$name" -- sudo journalctl -u limguard -n 20 --no-pager
+        return 1
     fi
+}
+
+# Test local node connectivity using the generated WireGuard config
+test_local_connectivity() {
+    local conf_path="$TMPDIR/$LOCAL_NODE-peer.conf"
+    
+    log "Testing local node connectivity..."
+    
+    # Verify config was generated
+    if [[ ! -f "$conf_path" ]]; then
+        error "WireGuard config not found: $conf_path"
+        return 1
+    fi
+    
+    # Verify config contains expected sections
+    if ! grep -q "\[Interface\]" "$conf_path" || ! grep -q "\[Peer\]" "$conf_path"; then
+        error "Config is missing expected sections"
+        cat "$conf_path"
+        return 1
+    fi
+    log "WireGuard config generated: $conf_path"
+    
+    # Bring up WireGuard interface (already running as root)
+    log "Bringing up WireGuard interface..."
+    wg-quick up "$conf_path"
+    
+    # Give it a moment to establish
+    sleep 2
+    
+    # Ping all peers
+    log "Pinging peers from local node..."
+    
+    if ping -c 3 -W 2 "$WG_IP1" &>/dev/null; then
+        log "Ping to $NODE1 ($WG_IP1) succeeded"
+    else
+        error "Ping to $NODE1 ($WG_IP1) failed"
+        wg show
+        return 1
+    fi
+    
+    if ping -c 3 -W 2 "$WG_IP2" &>/dev/null; then
+        log "Ping to $NODE2 ($WG_IP2) succeeded"
+    else
+        error "Ping to $NODE2 ($WG_IP2) failed"
+        wg show
+        return 1
+    fi
+    
+    log "Local node connectivity verified"
 }
 
 # Main
@@ -319,11 +349,10 @@ main() {
     SSH_PORT2=$(get_ssh_port "$NODE2")
     ENDPOINT1=$(get_vm_ip "$NODE1")
     ENDPOINT2=$(get_vm_ip "$NODE2")
-    LOCAL_ENDPOINT=$(get_local_ip)
     
     log "Node 1: SSH port=$SSH_PORT1, endpoint=$ENDPOINT1"
     log "Node 2: SSH port=$SSH_PORT2, endpoint=$ENDPOINT2"
-    log "Local: endpoint=$LOCAL_ENDPOINT"
+    log "Local node: WireGuard client (no daemon)"
     
     # Step 3: Enable SSH access in parallel
     log "Enabling SSH access in parallel..."
@@ -333,19 +362,21 @@ main() {
     pid2=$!
     wait $pid1 $pid2
     
-    # Step 4: Build binaries
+    # Step 4: Build binaries (only Linux needed for VMs)
     build_binaries
     
     # Step 5: Create config
-    create_config "$SSH_PORT1" "$SSH_PORT2" "$ENDPOINT1" "$ENDPOINT2" "$LOCAL_ENDPOINT"
+    create_config "$SSH_PORT1" "$SSH_PORT2" "$ENDPOINT1" "$ENDPOINT2"
     
-    # Step 6: Run apply (uses local binaries)
+    # Step 6: Run apply
     run_apply
     
-    # Step 7: Check services
+    # Step 7: Check services on VMs
     check_service "$NODE1"
     check_service "$NODE2"
-    check_service "$LOCAL_NODE"
+    
+    # Step 8: Test local node connectivity
+    test_local_connectivity
     
     echo ""
     log "========================================="
