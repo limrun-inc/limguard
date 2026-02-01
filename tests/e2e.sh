@@ -332,6 +332,11 @@ main() {
     
     check_prerequisites
     
+    # Initialize Lima config directory before parallel VM creation
+    # (prevents race condition when both VMs try to create ~/.lima/_config/user)
+    log "Initializing Lima..."
+    limactl_cmd list >/dev/null 2>&1 || true
+    
     # Step 1: Create and start VMs in parallel
     log "Creating VMs in parallel..."
     create_vm "$NODE1" &
