@@ -2,25 +2,7 @@
 
 This guide covers testing limguard using Lima VMs on macOS.
 
-## Automated Integration Test
-
-The easiest way to run the full integration test:
-
-```bash
-# Run the integration test (creates VMs, deploys, verifies, cleans up)
-go test -tags=integration -v -timeout=10m
-
-# Keep VMs after test for debugging
-LIMGUARD_TEST_NO_CLEANUP=1 go test -tags=integration -v -timeout=10m
-```
-
-The test is idempotent - it will reuse existing VMs if they exist.
-
-## Manual Testing
-
-If you prefer to run the steps manually, follow the guide below.
-
-### Prerequisites
+## Prerequisites
 
 - Go 1.21+
 - Lima (`brew install lima`)

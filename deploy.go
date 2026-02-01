@@ -13,11 +13,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/sync/errgroup"
 )
 
 // ApplyOptions holds options for the Apply command.
@@ -46,7 +48,7 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	// Connect to all nodes and keep connections open
+	// Connect to all nodes and keep connections open (in parallel)
 	type nodeConn struct {
 		ssh    *ssh.Client
 		sftp   *sftp.Client
@@ -55,6 +57,7 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 		isRoot bool
 	}
 	clients := make(map[string]*nodeConn)
+	var clientsMu sync.Mutex
 	defer func() {
 		for _, nc := range clients {
 			nc.sftp.Close()
@@ -63,108 +66,137 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 	}()
 
 	log.Info("connecting to nodes")
+	gConnect, _ := errgroup.WithContext(ctx)
 	for name, node := range cfg.Nodes {
-		sshClient, err := sshConnect(node.SSH, opts.SSHKeyPath)
-		if err != nil {
-			return fmt.Errorf("ssh connect to %s: %w", name, err)
-		}
-		sftpClient, err := sftp.NewClient(sshClient)
-		if err != nil {
-			sshClient.Close()
-			return fmt.Errorf("sftp connect to %s: %w", name, err)
-		}
-		osName, arch := detectPlatform(sshClient)
-		// Check if already root (uid 0)
-		uidOut, _ := sshRun(sshClient, "id -u")
-		isRoot := strings.TrimSpace(uidOut) == "0"
-		clients[name] = &nodeConn{ssh: sshClient, sftp: sftpClient, osName: osName, arch: arch, isRoot: isRoot}
-		log.Info("connected", "node", name, "os", osName, "arch", arch, "root", isRoot)
+		name, node := name, node // capture loop variables
+
+		gConnect.Go(func() error {
+			sshClient, err := sshConnect(node.SSH, opts.SSHKeyPath)
+			if err != nil {
+				return fmt.Errorf("ssh connect to %s: %w", name, err)
+			}
+			sftpClient, err := sftp.NewClient(sshClient)
+			if err != nil {
+				sshClient.Close()
+				return fmt.Errorf("sftp connect to %s: %w", name, err)
+			}
+			osName, arch := detectPlatform(sshClient)
+			// Check if already root (uid 0)
+			uidOut, _ := sshRun(sshClient, "id -u")
+			isRoot := strings.TrimSpace(uidOut) == "0"
+
+			clientsMu.Lock()
+			clients[name] = &nodeConn{ssh: sshClient, sftp: sftpClient, osName: osName, arch: arch, isRoot: isRoot}
+			clientsMu.Unlock()
+
+			log.Info("connected", "node", name, "os", osName, "arch", arch, "root", isRoot)
+			return nil
+		})
 	}
 
-	// Pass 1: Bootstrap each node
+	if err := gConnect.Wait(); err != nil {
+		return err
+	}
+
+	// Pass 1: Bootstrap each node (in parallel)
 	log.Info("pass 1: bootstrapping nodes")
 	publicKeys := make(map[string]string)
+	var pkMu sync.Mutex
 
+	g, _ := errgroup.WithContext(ctx)
 	for name, node := range cfg.Nodes {
+		name, node := name, node // capture loop variables
 		nc := clients[name]
-		log.Info("bootstrapping", "node", name)
 
-		binaryName := fmt.Sprintf("limguard-%s-%s", nc.osName, nc.arch)
-		localBinaryPath := filepath.Join(cfg.ArtifactDir, binaryName)
+		g.Go(func() error {
+			log.Info("bootstrapping", "node", name)
 
-		// Check if binary needs to be copied (compare SHA256 hashes)
-		localHash, err := fileSHA256(localBinaryPath)
-		if err != nil {
-			return fmt.Errorf("compute local binary hash for %s: %w", name, err)
-		}
-		remoteHash, _ := remoteFileSHA256(nc.ssh, nc.sftp, cfg.BinaryPath)
+			binaryName := fmt.Sprintf("limguard-%s-%s", nc.osName, nc.arch)
+			localBinaryPath := filepath.Join(cfg.ArtifactDir, binaryName)
 
-		if localHash != remoteHash {
-			log.Info("copying binary", "node", name, "localHash", localHash[:8], "remoteHash", remoteHash[:min(8, len(remoteHash))])
-			// Copy binary to temp location via SFTP
-			tmpBinary := "/tmp/limguard-binary"
-			if err := sftpCopyFile(nc.sftp, localBinaryPath, tmpBinary); err != nil {
-				return fmt.Errorf("copy binary to %s: %w", name, err)
+			// Check if binary needs to be copied (compare SHA256 hashes)
+			localHash, err := fileSHA256(localBinaryPath)
+			if err != nil {
+				return fmt.Errorf("compute local binary hash for %s: %w", name, err)
 			}
-		} else {
-			log.Info("binary unchanged", "node", name, "sha256", localHash[:8])
-		}
+			remoteHash, _ := remoteFileSHA256(nc.ssh, nc.sftp, cfg.BinaryPath)
 
-		// Write minimal config for this node (empty publicKey to skip validation during bootstrap)
-		minCfg := &Config{
-			InterfaceName:  cfg.InterfaceName,
-			ListenPort:     cfg.ListenPort,
-			PrivateKeyPath: cfg.PrivateKeyPath,
-			Nodes:          map[string]Node{name: {WireguardIP: node.WireguardIP, Endpoint: node.Endpoint, PublicKey: ""}},
-		}
-		tmpCfg := "/tmp/limguard-bootstrap.yaml"
-		cfgData, err := minCfg.ToYAML()
-		if err != nil {
-			return fmt.Errorf("marshal config for %s: %w", name, err)
-		}
-		if err := sftpWriteFile(nc.sftp, tmpCfg, cfgData); err != nil {
-			return fmt.Errorf("write config to %s: %w", name, err)
-		}
+			if localHash != remoteHash {
+				log.Info("copying binary", "node", name, "localHash", localHash[:8], "remoteHash", remoteHash[:min(8, len(remoteHash))])
+				// Copy binary to temp location via SFTP
+				tmpBinary := "/tmp/limguard-binary"
+				if err := sftpCopyFile(nc.sftp, localBinaryPath, tmpBinary); err != nil {
+					return fmt.Errorf("copy binary to %s: %w", name, err)
+				}
+			} else {
+				log.Info("binary unchanged", "node", name, "sha256", localHash[:8])
+			}
 
-		// Run all privileged operations in a single bash session (elevated if needed)
-		setupScript := fmt.Sprintf(`
+			// Write minimal config for this node (empty publicKey to skip validation during bootstrap)
+			minCfg := &Config{
+				InterfaceName:  cfg.InterfaceName,
+				ListenPort:     cfg.ListenPort,
+				PrivateKeyPath: cfg.PrivateKeyPath,
+				Nodes:          map[string]Node{name: {WireguardIP: node.WireguardIP, Endpoint: node.Endpoint, PublicKey: ""}},
+			}
+			tmpCfg := "/tmp/limguard-bootstrap.yaml"
+			cfgData, err := minCfg.ToYAML()
+			if err != nil {
+				return fmt.Errorf("marshal config for %s: %w", name, err)
+			}
+			if err := sftpWriteFile(nc.sftp, tmpCfg, cfgData); err != nil {
+				return fmt.Errorf("write config to %s: %w", name, err)
+			}
+
+			// Run all privileged operations in a single bash session (elevated if needed)
+			setupScript := fmt.Sprintf(`
 mkdir -p %s %s
 if [ -f /tmp/limguard-binary ]; then mv /tmp/limguard-binary %s && chmod 755 %s; fi
 mv %s %s
 `, filepath.Dir(DefaultConfigPath), filepath.Dir(cfg.PrivateKeyPath),
-			cfg.BinaryPath, cfg.BinaryPath,
-			tmpCfg, DefaultConfigPath)
+				cfg.BinaryPath, cfg.BinaryPath,
+				tmpCfg, DefaultConfigPath)
 
-		if _, err := runAsRoot(nc.ssh, nc.isRoot, setupScript); err != nil {
-			return fmt.Errorf("setup node %s: %w", name, err)
-		}
-
-		// Install and start service (runs limguard run, which bootstraps if needed)
-		if nc.osName == "linux" {
-			if err := installLinuxService(nc.ssh, nc.sftp, nc.isRoot, cfg, name); err != nil {
-				return fmt.Errorf("install linux service on %s: %w", name, err)
+			if _, err := runAsRoot(nc.ssh, nc.isRoot, setupScript); err != nil {
+				return fmt.Errorf("setup node %s: %w", name, err)
 			}
-		} else {
-			if err := installDarwinService(nc.ssh, nc.sftp, nc.isRoot, cfg, name); err != nil {
-				return fmt.Errorf("install darwin service on %s: %w", name, err)
-			}
-		}
 
-		// Poll for pubkey file (written by limguard run on startup)
-		pubkeyPath := cfg.PrivateKeyPath + ".pub"
-		pubKey, err := waitForPubkey(nc.ssh, nc.sftp, nc.isRoot, pubkeyPath, 3*time.Second)
-		if err != nil {
-			// Fetch service logs to show what went wrong
-			var serviceLogs string
+			// Install and start service (runs limguard run, which bootstraps if needed)
 			if nc.osName == "linux" {
-				serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "journalctl -u limguard -n 50 --no-pager 2>&1")
+				if err := installLinuxService(nc.ssh, nc.sftp, nc.isRoot, cfg, name); err != nil {
+					return fmt.Errorf("install linux service on %s: %w", name, err)
+				}
 			} else {
-				serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "cat /var/log/system.log | grep limguard | tail -50 2>&1")
+				if err := installDarwinService(nc.ssh, nc.sftp, nc.isRoot, cfg, name); err != nil {
+					return fmt.Errorf("install darwin service on %s: %w", name, err)
+				}
 			}
-			return fmt.Errorf("wait for pubkey on %s: %w\nservice logs:\n%s", name, err, serviceLogs)
-		}
-		publicKeys[name] = pubKey
-		log.Info("bootstrapped", "node", name, "publicKey", pubKey)
+
+			// Poll for pubkey file (written by limguard run on startup)
+			pubkeyPath := cfg.PrivateKeyPath + ".pub"
+			pubKey, err := waitForPubkey(nc.ssh, nc.sftp, nc.isRoot, pubkeyPath, 3*time.Second)
+			if err != nil {
+				// Fetch service logs to show what went wrong
+				var serviceLogs string
+				if nc.osName == "linux" {
+					serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "journalctl -u limguard -n 50 --no-pager 2>&1")
+				} else {
+					serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "cat /var/log/system.log | grep limguard | tail -50 2>&1")
+				}
+				return fmt.Errorf("wait for pubkey on %s: %w\nservice logs:\n%s", name, err, serviceLogs)
+			}
+
+			pkMu.Lock()
+			publicKeys[name] = pubKey
+			pkMu.Unlock()
+
+			log.Info("bootstrapped", "node", name, "publicKey", pubKey)
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
 	// Update config with public keys
@@ -180,40 +212,112 @@ mv %s %s
 	}
 	log.Info("updated local config with public keys")
 
-	// Pass 2: Distribute full config and restart services (reuse connections)
+	// Pass 2: Distribute full config (in parallel)
+	// If service is running, limguard will pick up the config change via file watcher.
+	// If not running, start the service.
 	log.Info("pass 2: distributing full config")
 	cfgYAML, err := cfg.ToYAML()
 	if err != nil {
 		return fmt.Errorf("marshal final config: %w", err)
 	}
 
+	g2, _ := errgroup.WithContext(ctx)
 	for name := range cfg.Nodes {
+		name := name // capture loop variable
 		nc := clients[name]
-		log.Info("updating config", "node", name)
 
-		// Write final config via SFTP
-		tmpCfg := "/tmp/limguard.yaml"
-		if err := sftpWriteFile(nc.sftp, tmpCfg, cfgYAML); err != nil {
-			return fmt.Errorf("write final config to %s: %w", name, err)
-		}
+		g2.Go(func() error {
+			log.Info("updating config", "node", name)
 
-		// Move config and restart service in single elevated session
-		var restartErr error
-		if nc.osName == "linux" {
-			_, restartErr = runAsRoot(nc.ssh, nc.isRoot, fmt.Sprintf("mv %s %s && systemctl restart limguard", tmpCfg, DefaultConfigPath))
-		} else {
-			plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
-			_, restartErr = runAsRoot(nc.ssh, nc.isRoot, fmt.Sprintf("mv %s %s && launchctl unload %s && launchctl load %s",
-				tmpCfg, DefaultConfigPath, plistPath, plistPath))
-		}
-		if restartErr != nil {
-			return fmt.Errorf("restart service on %s: %w", name, restartErr)
-		}
+			// Write final config via SFTP
+			tmpCfg := "/tmp/limguard.yaml"
+			if err := sftpWriteFile(nc.sftp, tmpCfg, cfgYAML); err != nil {
+				return fmt.Errorf("write final config to %s: %w", name, err)
+			}
 
-		log.Info("configured", "node", name)
+			// Move config, then ensure service is running (start only if not already running)
+			var out string
+			var ensureErr error
+			if nc.osName == "linux" {
+				out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, fmt.Sprintf(`
+mv %s %s
+if systemctl is-active --quiet limguard; then
+    echo "RUNNING"
+else
+    systemctl start limguard
+    echo "STARTED"
+fi
+`, tmpCfg, DefaultConfigPath))
+			} else {
+				plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
+				out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, fmt.Sprintf(`
+mv %s %s
+if launchctl list | grep -q com.limrun.limguard; then
+    echo "RUNNING"
+else
+    launchctl load %s
+    echo "STARTED"
+fi
+`, tmpCfg, DefaultConfigPath, plistPath))
+			}
+			if ensureErr != nil {
+				return fmt.Errorf("update config on %s: %w", name, ensureErr)
+			}
+
+			status := strings.TrimSpace(out)
+			if status == "RUNNING" {
+				log.Info("configured", "node", name, "action", "config updated (service was running)")
+			} else {
+				log.Info("configured", "node", name, "action", "service started")
+			}
+			return nil
+		})
 	}
 
-	log.Info("deployment complete")
+	if err := g2.Wait(); err != nil {
+		return err
+	}
+
+	// Pass 3: Validate mesh connectivity (in parallel)
+	log.Info("pass 3: validating mesh connectivity")
+
+	// Wait for config to be picked up by file watcher
+	time.Sleep(2 * time.Second)
+
+	g3, _ := errgroup.WithContext(ctx)
+	for name := range cfg.Nodes {
+		name := name // capture loop variable
+		nc := clients[name]
+		node := cfg.Nodes[name]
+
+		g3.Go(func() error {
+			// Ping all peers from this node
+			for peerName, peer := range cfg.Nodes {
+				if peerName == name {
+					continue // skip self
+				}
+
+				// Ping peer's WireGuard IP
+				pingCmd := fmt.Sprintf("ping -c 3 -W 2 %s", peer.WireguardIP)
+				out, err := runAsRoot(nc.ssh, nc.isRoot, pingCmd)
+				if err != nil {
+					return fmt.Errorf("ping from %s (%s) to %s (%s) failed: %w",
+						name, node.WireguardIP, peerName, peer.WireguardIP, err)
+				}
+
+				// Parse latency from ping output (e.g., "rtt min/avg/max/mdev = 0.1/0.2/0.3/0.0 ms")
+				latency := parsePingLatency(out)
+				log.Info("ping ok", "from", name, "to", peerName, "ip", peer.WireguardIP, "latency", latency)
+			}
+			return nil
+		})
+	}
+
+	if err := g3.Wait(); err != nil {
+		return err
+	}
+
+	log.Info("deployment complete - mesh connectivity verified")
 	return nil
 }
 
@@ -233,49 +337,57 @@ func parseApplyArgs(args []string) (*ApplyOptions, error) {
 
 func sshConnect(s *SSH, keyPath string) (*ssh.Client, error) {
 	var authMethods []ssh.AuthMethod
+	var signers []ssh.Signer
 
 	// Get home directory early for path expansion
 	home, _ := os.UserHomeDir()
 
-	// SSH agent
+	// Explicit key from command line (error if specified but can't be used)
+	if keyPath != "" {
+		signer, err := loadPrivateKey(keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load SSH key %s: %w", keyPath, err)
+		}
+		signers = append(signers, signer)
+	}
+
+	// Identity file from config (error if specified but can't be used)
+	if s.IdentityFile != "" {
+		identityPath := s.IdentityFile
+		if strings.HasPrefix(identityPath, "~/") {
+			identityPath = filepath.Join(home, identityPath[2:])
+		}
+		signer, err := loadPrivateKey(identityPath)
+		if err != nil {
+			return nil, fmt.Errorf("load SSH key %s: %w", identityPath, err)
+		}
+		signers = append(signers, signer)
+	}
+
+	// Default keys (silently skip if not available)
+	if home != "" {
+		for _, name := range []string{"id_ed25519", "id_rsa"} {
+			kp := filepath.Join(home, ".ssh", name)
+			if signer, err := loadPrivateKey(kp); err == nil {
+				signers = append(signers, signer)
+			}
+		}
+	}
+
+	// Add explicit signers first (higher priority than agent)
+	if len(signers) > 0 {
+		authMethods = append(authMethods, ssh.PublicKeys(signers...))
+	}
+
+	// SSH agent as fallback
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
 		if conn, err := net.Dial("unix", sock); err == nil {
 			authMethods = append(authMethods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
 		}
 	}
 
-	// Explicit key from command line
-	if keyPath != "" {
-		if key, err := os.ReadFile(keyPath); err == nil {
-			if signer, err := ssh.ParsePrivateKey(key); err == nil {
-				authMethods = append(authMethods, ssh.PublicKeys(signer))
-			}
-		}
-	}
-
-	// Identity file from config (expand ~ to home directory)
-	if s.IdentityFile != "" {
-		identityPath := s.IdentityFile
-		if strings.HasPrefix(identityPath, "~/") {
-			identityPath = filepath.Join(home, identityPath[2:])
-		}
-		if key, err := os.ReadFile(identityPath); err == nil {
-			if signer, err := ssh.ParsePrivateKey(key); err == nil {
-				authMethods = append(authMethods, ssh.PublicKeys(signer))
-			}
-		}
-	}
-
-	// Default keys
-	if home != "" {
-		for _, name := range []string{"id_ed25519", "id_rsa"} {
-			kp := filepath.Join(home, ".ssh", name)
-			if key, err := os.ReadFile(kp); err == nil {
-				if signer, err := ssh.ParsePrivateKey(key); err == nil {
-					authMethods = append(authMethods, ssh.PublicKeys(signer))
-				}
-			}
-		}
+	if len(authMethods) == 0 {
+		return nil, fmt.Errorf("no SSH authentication methods available")
 	}
 
 	sshCfg := &ssh.ClientConfig{
@@ -285,6 +397,23 @@ func sshConnect(s *SSH, keyPath string) (*ssh.Client, error) {
 		Timeout:         30 * time.Second,
 	}
 	return ssh.Dial("tcp", net.JoinHostPort(s.Host, fmt.Sprintf("%d", s.Port)), sshCfg)
+}
+
+// loadPrivateKey reads and parses an SSH private key file.
+// Returns a helpful error if the key is passphrase-protected.
+func loadPrivateKey(path string) (ssh.Signer, error) {
+	key, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	signer, err := ssh.ParsePrivateKey(key)
+	if err != nil {
+		if strings.Contains(err.Error(), "cannot decode encrypted private key") {
+			return nil, fmt.Errorf("key is passphrase-protected (add to ssh-agent with: ssh-add %s)", path)
+		}
+		return nil, err
+	}
+	return signer, nil
 }
 
 func sshRun(client *ssh.Client, cmd string) (string, error) {
@@ -326,6 +455,35 @@ func runAsRoot(client *ssh.Client, isRoot bool, script string) (string, error) {
 		return stdout.String(), fmt.Errorf("%w: %s", err, stderr.String())
 	}
 	return stdout.String(), nil
+}
+
+// parsePingLatency extracts the average latency from ping output.
+// Returns the avg latency string (e.g., "1.234 ms") or "unknown" if parsing fails.
+func parsePingLatency(output string) string {
+	// Linux format: rtt min/avg/max/mdev = 0.123/0.456/0.789/0.012 ms
+	// macOS format: round-trip min/avg/max/stddev = 0.123/0.456/0.789/0.012 ms
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "min/avg/max") {
+			// Find the = and parse the values after it
+			parts := strings.Split(line, "=")
+			if len(parts) < 2 {
+				continue
+			}
+			stats := strings.TrimSpace(parts[1])
+			// stats is like "0.123/0.456/0.789/0.012 ms"
+			fields := strings.Fields(stats)
+			if len(fields) < 2 {
+				continue
+			}
+			values := strings.Split(fields[0], "/")
+			unit := fields[1]
+			if len(values) >= 2 {
+				return values[1] + " " + unit // avg value
+			}
+		}
+	}
+	return "unknown"
 }
 
 func waitForPubkey(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, path string, timeout time.Duration) (string, error) {
