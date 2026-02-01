@@ -175,7 +175,13 @@ func (nm *NetworkManager) SetPeer(ctx context.Context, publicKey, endpoint, wire
 	out, err := exec.Command("route", "-n", "get", wireguardIP).CombinedOutput()
 	if err != nil || !ifaceRe.Match(out) {
 		if routeOut, routeErr := exec.Command("route", "-n", "add", "-host", wireguardIP, "-interface", nm.iface).CombinedOutput(); routeErr != nil {
-			return fmt.Errorf("add route for %s: %s: %w", wireguardIP, routeOut, routeErr)
+			// Ignore "route already exists" errors - can happen due to race conditions
+			// between the check (route -n get) and add (route -n add). Unlike Linux's
+			// netlink.RouteReplace which is idempotent, macOS route add fails if the route exists.
+			outStr := strings.ToLower(string(routeOut))
+			if !strings.Contains(outStr, "exists") {
+				return fmt.Errorf("add route for %s: %s: %w", wireguardIP, routeOut, routeErr)
+			}
 		}
 	}
 
