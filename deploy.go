@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -1010,6 +1009,21 @@ func isLocalNode(node Node) bool {
 
 // uninstallNode stops and removes the limguard service from a node.
 func uninstallNode(ctx context.Context, nc *nodeConn, nodeName, ifaceName string, log *slog.Logger) error {
+	// Local nodes: just remove ~/.limguard/ directory (no daemon was installed)
+	if nc.local {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("get home directory: %w", err)
+		}
+		keyDir := filepath.Join(home, ".limguard", "privatekey")
+		if err := os.RemoveAll(keyDir); err != nil {
+			return fmt.Errorf("remove key directory: %w", err)
+		}
+		log.Info("local node removed", "node", nodeName, "removed", keyDir)
+		return nil
+	}
+
+	// Remote nodes: uninstall service and clean up
 	var uninstallScript string
 	if nc.osName == "linux" {
 		uninstallScript = fmt.Sprintf(`
@@ -1035,13 +1049,7 @@ echo "UNINSTALLED"
 `, ifaceName)
 	}
 
-	var out string
-	var err error
-	if nc.local {
-		out, err = localRunAsRoot(ctx, uninstallScript)
-	} else {
-		out, err = runAsRoot(nc.ssh, nc.isRoot, uninstallScript)
-	}
+	out, err := runAsRoot(nc.ssh, nc.isRoot, uninstallScript)
 	if err != nil {
 		return fmt.Errorf("uninstall script failed: %w", err)
 	}
@@ -1050,27 +1058,6 @@ echo "UNINSTALLED"
 		log.Info("node uninstalled", "node", nodeName)
 	}
 	return nil
-}
-
-// localRunAsRoot runs a shell script locally as root.
-// If already root, runs directly; otherwise uses sudo.
-func localRunAsRoot(ctx context.Context, script string) (string, error) {
-	var cmd *exec.Cmd
-	if os.Geteuid() == 0 {
-		cmd = exec.CommandContext(ctx, "sh", "-s")
-	} else {
-		cmd = exec.CommandContext(ctx, "sudo", "sh", "-s")
-	}
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	cmd.Stdin = strings.NewReader(script)
-
-	if err := cmd.Run(); err != nil {
-		return stdout.String(), fmt.Errorf("%w: %s", err, stderr.String())
-	}
-	return stdout.String(), nil
 }
 
 // localDetectPlatform returns the OS and architecture of the local machine.
