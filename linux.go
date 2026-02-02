@@ -101,6 +101,23 @@ func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP
 		cancel:   cancel,
 	}
 
+	// Load existing peers from WireGuard device so we can remove stale ones
+	device, err := wgClient.Device(iface)
+	if err != nil {
+		wgClient.Close()
+		return nil, fmt.Errorf("get device info: %w", err)
+	}
+	for _, peer := range device.Peers {
+		// Extract the WireGuard IP from AllowedIPs (the /32 one)
+		for _, allowedIP := range peer.AllowedIPs {
+			ones, _ := allowedIP.Mask.Size()
+			if ones == 32 && allowedIP.IP.To4() != nil {
+				nm.peers[allowedIP.IP.String()] = peer.PublicKey.String()
+				break
+			}
+		}
+	}
+
 	go nm.syncAllowedIPsLoop()
 	success = true
 	return nm, nil

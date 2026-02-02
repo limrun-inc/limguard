@@ -119,6 +119,7 @@ Nodes with `ssh.host: self` are treated as local WireGuard clients:
 - Private key is generated in `~/.limguard/privatekey`
 - Public key is distributed to all remote nodes as a peer
 - A WireGuard INI config is written to `<node-name>-peer.conf` (customizable via `--local-wireguard-conf-path`)
+- On deletion (`action: Delete`), keys are preserved in `~/.limguard/` for future reuse; the node is simply removed from remote peers
 
 Example config entry:
 ```yaml

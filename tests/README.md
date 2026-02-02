@@ -4,10 +4,10 @@ This directory contains integration tests for limguard using Lima VMs.
 
 ## Prerequisites
 
-### 1. Install Lima
+### 1. Install Lima & Wireguard
 
 ```bash
-brew install lima
+brew install lima wireguard-tools
 ```
 
 ### 2. Install and Configure socket_vmnet
@@ -40,13 +40,14 @@ Ensure you have an SSH key at `~/.ssh/id_ed25519` or `~/.ssh/id_rsa`.
 
 ### End-to-End Test (Two VMs + Local Node)
 
-Tests mesh connectivity between two Lima VMs and your local machine. Uses `wg-quick` to bring up the generated WireGuard config and ping peers:
+Tests the full limguard lifecycle:
+1. **Initial deployment**: Deploys limguard to two Lima VMs, generates WireGuard config for local node
+2. **Connectivity test**: Uses `wg-quick` to bring up local WireGuard interface and ping all peers
+3. **Node deletion**: Marks one VM for deletion, runs apply, verifies the peer is removed from remaining nodes
 
 ```bash
 sudo ./e2e.sh
 ```
-
-**Note:** Requires `wireguard-tools` (`brew install wireguard-tools`) and sudo for WireGuard operations.
 
 ## Options
 

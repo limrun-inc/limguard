@@ -348,6 +348,91 @@ test_local_connectivity() {
     log "Local node connectivity verified"
 }
 
+# Mark NODE2 for deletion in the config
+mark_node_for_deletion() {
+    log "Marking $NODE2 for deletion..."
+    
+    # Use awk to add 'action: Delete' after the NODE2 line
+    # Go's YAML library uses 4-space indentation, so node names are at 4 spaces
+    # and their properties are at 8 spaces
+    local tmp_config="$TMPDIR/limguard.yaml.tmp"
+    awk -v node="$NODE2" '
+        {print}
+        $0 ~ "^    " node ":$" {print "        action: Delete"}
+    ' "$TMPDIR/limguard.yaml" > "$tmp_config"
+    mv "$tmp_config" "$TMPDIR/limguard.yaml"
+    
+    log "Config updated with deletion marker"
+}
+
+# Run limguard apply for deletion
+run_apply_deletion() {
+    log "Running limguard apply (deletion pass)..."
+    cd "$PROJECT_ROOT"
+    
+    # Bring down local WireGuard first since config will change
+    wg-quick down "$TMPDIR/$LOCAL_NODE-peer.conf" 2>/dev/null || true
+    
+    go run ./cmd/limguard/ apply --config "$TMPDIR/limguard.yaml" --local-wireguard-conf-path "$TMPDIR/$LOCAL_NODE-peer.conf"
+}
+
+# Verify the deleted node's peer is removed from remaining nodes
+test_deletion() {
+    log "Testing node deletion..."
+    
+    # Get the public key of the deleted node from config (before it's removed)
+    local deleted_pubkey
+    deleted_pubkey=$(grep -A5 "$NODE2:" "$TMPDIR/limguard.yaml" | grep "publicKey:" | awk '{print $2}' | tr -d '"')
+    
+    if [[ -z "$deleted_pubkey" ]]; then
+        error "Could not find public key for deleted node"
+        return 1
+    fi
+    log "Deleted node public key: $deleted_pubkey"
+    
+    # Check that NODE1 no longer has NODE2 as a peer
+    log "Checking $NODE1 no longer has $NODE2 as peer..."
+    local peers_on_node1
+    peers_on_node1=$(limactl_cmd shell "$NODE1" -- sudo wg show wg0 peers 2>/dev/null || echo "")
+    
+    if echo "$peers_on_node1" | grep -q "$deleted_pubkey"; then
+        error "$NODE1 still has deleted peer $NODE2"
+        error "Current peers on $NODE1:"
+        limactl_cmd shell "$NODE1" -- sudo wg show wg0
+        return 1
+    fi
+    log "$NODE1 no longer has $NODE2 as peer"
+    
+    # Verify NODE1 service is still running
+    check_service "$NODE1"
+    
+    # Bring up local WireGuard with new config (which should only have NODE1)
+    log "Bringing up local WireGuard with updated config..."
+    wg-quick up "$TMPDIR/$LOCAL_NODE-peer.conf"
+    sleep 2
+    
+    # Verify local can still reach NODE1
+    if ping -c 3 -W 2 "$WG_IP1" &>/dev/null; then
+        log "Ping to $NODE1 ($WG_IP1) after deletion succeeded"
+    else
+        error "Ping to $NODE1 ($WG_IP1) after deletion failed"
+        wg show
+        return 1
+    fi
+    
+    # Verify local config only has NODE1 as peer (not NODE2)
+    local peer_count
+    peer_count=$(grep -c "\[Peer\]" "$TMPDIR/$LOCAL_NODE-peer.conf")
+    if [[ "$peer_count" -ne 1 ]]; then
+        error "Local config should have 1 peer after deletion, found $peer_count"
+        cat "$TMPDIR/$LOCAL_NODE-peer.conf"
+        return 1
+    fi
+    log "Local config correctly has only 1 peer after deletion"
+    
+    log "Node deletion verified successfully"
+}
+
 # Main
 main() {
     log "Starting integration test with local node..."
@@ -405,7 +490,19 @@ main() {
     
     echo ""
     log "========================================="
-    log "Integration test with local node PASSED!"
+    log "Initial deployment PASSED!"
+    log "========================================="
+    echo ""
+    
+    # Step 10: Test node deletion
+    log "Testing node deletion flow..."
+    mark_node_for_deletion
+    run_apply_deletion
+    test_deletion
+    
+    echo ""
+    log "========================================="
+    log "All integration tests PASSED!"
     log "========================================="
 }
 

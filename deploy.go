@@ -1009,17 +1009,10 @@ func isLocalNode(node Node) bool {
 
 // uninstallNode stops and removes the limguard service from a node.
 func uninstallNode(ctx context.Context, nc *nodeConn, nodeName, ifaceName string, log *slog.Logger) error {
-	// Local nodes: just remove ~/.limguard/ directory (no daemon was installed)
+	// Local nodes: nothing to uninstall (no daemon was installed).
+	// The node is simply removed from peers on remote nodes.
 	if nc.local {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("get home directory: %w", err)
-		}
-		keyDir := filepath.Join(home, ".limguard", "privatekey")
-		if err := os.RemoveAll(keyDir); err != nil {
-			return fmt.Errorf("remove key directory: %w", err)
-		}
-		log.Info("local node removed", "node", nodeName, "removed", keyDir)
+		log.Info("local node removed from mesh", "node", nodeName)
 		return nil
 	}
 
