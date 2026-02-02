@@ -1,7 +1,28 @@
 # limguard - WireGuard Mesh Network Manager
 
-`limguard` sets up WireGuard peers between nodes using a single YAML config file.
-It runs as a systemd/launchd service and can be deployed before Kubernetes.
+`limguard` sets up an encrypted VPC for your cluster using WireGuard.
+Once set up, you can then use any CNI like Calico, Cilium etc to work
+with `wg0` interface to run on this fabric.
+
+The best use cases are the public nodes where you'd like your inter-node
+communication to be over private network and encrypted.
+
+## Installation
+
+### macOS (Homebrew)
+
+```bash
+brew install limrun-inc/limguard/limguard
+```
+
+### Linux
+
+```bash
+ARCH=amd64
+curl -Lo limguard https://github.com/limrun-inc/limguard/releases/latest/download/limguard-linux-${ARCH}
+chmod +x limguard
+sudo mv limguard /usr/local/bin/
+```
 
 ## Quick Start
 
@@ -31,13 +52,10 @@ nodes:
 limguard apply --config limguard.yaml
 ```
 
-This:
-1. Downloads the correct binary for each node from GitHub releases
-2. Installs binary on each node
-3. Generates WireGuard keys and brings up interface
-4. Collects public keys and updates your local YAML
-5. Distributes the complete config to all nodes
-6. Starts the daemon on all nodes
+Once deployed, the mesh network is established and the daemon watches for
+routes that your CNI adds and makes sure WireGuard is aware of them as well,
+which means pod & service CIDRs work just as if all is in the same private
+network.
 
 ## Config Format
 
@@ -67,7 +85,6 @@ nodes:
   # Local node (join mesh from this machine)
   ops-laptop:
     wireguardIP: "10.200.0.50"
-    endpoint: "203.0.113.50:51821"
     ssh:
       host: self               # Special value: configure locally, no SSH
 ```
@@ -88,24 +105,41 @@ You can temporarily join the mesh from your local machine (e.g., for operations)
 nodes:
   ops-laptop:
     wireguardIP: "10.200.0.50"
-    endpoint: "your.public.ip:51821"
     ssh:
       host: self    # Special value: no SSH, configure locally
 ```
 
-Run with root privileges:
+Run:
 ```bash
-sudo limguard apply --config limguard.yaml
+limguard apply --config limguard.yaml --local-wireguard-conf-path ops-laptop.conf
 ```
 
-To disconnect, remove the node from config and re-run `apply`. Other nodes will automatically remove it as a peer.
+It will write a WireGuard config at `ops-laptop.conf` that you
+can import in your WireGuard GUI and connect the network.
+
+Once you're done, you can mark `ops-laptop` for deletion so that its public
+key is removed from the nodes:
+
+```yaml
+nodes:
+  ops-laptop:
+    action: Delete
+    ...
+```
+
+Run:
+```bash
+limguard apply --config limguard.yaml
+```
 
 ## How It Works
 
 - Each node runs `limguard run` as a service
 - The daemon loads config on startup and configures WireGuard peers
 - To update peers, restart the service after updating the config file
-- Routes through the WireGuard interface are synced to allowed IPs
+- Routes through the WireGuard interface are synced to allowed IPs.
+  - Allowed IPs include the CIDRs your CNI adds on the host so you have
+    full network capabilities of a LAN.
 
 ## Versioning
 
@@ -135,9 +169,9 @@ nodes:
 
 When `localBinaryPath` is set for a node, that binary is used instead of downloading from GitHub releases. If all nodes have `localBinaryPath` set, version resolution and downloads are skipped entirely.
 
-## Manual Setup
+## Troubleshooting
 
-If not using `apply`, see [OPERATIONS.md](./OPERATIONS.md) for manual installation steps.
+See [`OPERATIONS.md`](./OPERATIONS.md) for helpful tips.
 
 ## License
 
