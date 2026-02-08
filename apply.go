@@ -1012,7 +1012,7 @@ func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot
 	if err := sftpWriteFile(sftpClient, tmpPlist, []byte(plist)); err != nil {
 		return fmt.Errorf("write plist file: %w", err)
 	}
-	_, err := runAsRoot(sshClient, isRoot, sudoPassword, fmt.Sprintf("launchctl unload %s 2>/dev/null || true; mv %s %s && launchctl load %s", plistPath, tmpPlist, plistPath, plistPath))
+	_, err := runAsRoot(sshClient, isRoot, sudoPassword, fmt.Sprintf("launchctl unload %s 2>/dev/null || true; mv %s %s && chown root:wheel %s && chmod 644 %s && launchctl load %s", plistPath, tmpPlist, plistPath, plistPath, plistPath, plistPath))
 	return err
 }
 
