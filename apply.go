@@ -34,12 +34,13 @@ type ApplyOptions struct {
 
 // nodeConn holds connection info for a node during deployment.
 type nodeConn struct {
-	ssh    *ssh.Client
-	sftp   *sftp.Client
-	osName string
-	arch   string
-	isRoot bool
-	local  bool // true if this is the local machine (ssh.host: self)
+	ssh          *ssh.Client
+	sftp         *sftp.Client
+	osName       string
+	arch         string
+	isRoot       bool
+	local        bool   // true if this is the local machine (ssh.host: self)
+	sudoPassword string // optional sudo password for nodes where sudo requires a password
 }
 
 // Apply deploys limguard to remote nodes via SSH.
@@ -120,8 +121,13 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 			uidOut, _ := sshRun(sshClient, "id -u")
 			isRoot := strings.TrimSpace(uidOut) == "0"
 
+			var sudoPass string
+			if node.SSH != nil && node.SSH.SudoPassword != nil {
+				sudoPass = *node.SSH.SudoPassword
+			}
+
 			clientsMu.Lock()
-			clients[name] = &nodeConn{ssh: sshClient, sftp: sftpClient, osName: osName, arch: arch, isRoot: isRoot}
+			clients[name] = &nodeConn{ssh: sshClient, sftp: sftpClient, osName: osName, arch: arch, isRoot: isRoot, sudoPassword: sudoPass}
 			clientsMu.Unlock()
 
 			log.Info("connected", "node", name, "os", osName, "arch", arch, "root", isRoot)
@@ -321,31 +327,31 @@ mv %s %s
 				DefaultBinaryPath, DefaultBinaryPath,
 				tmpCfg, DefaultConfigPath)
 
-			if _, err := runAsRoot(nc.ssh, nc.isRoot, setupScript); err != nil {
+			if _, err := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, setupScript); err != nil {
 				return fmt.Errorf("setup node %s: %w", name, err)
 			}
 
 			// Install and start service (runs limguard run, which bootstraps if needed)
 			if nc.osName == "linux" {
-				if err := installLinuxService(nc.ssh, nc.sftp, nc.isRoot, name); err != nil {
+				if err := installLinuxService(nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, name); err != nil {
 					return fmt.Errorf("install linux service on %s: %w", name, err)
 				}
 			} else {
-				if err := installDarwinService(nc.ssh, nc.sftp, nc.isRoot, name); err != nil {
+				if err := installDarwinService(nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, name); err != nil {
 					return fmt.Errorf("install darwin service on %s: %w", name, err)
 				}
 			}
 
 			// Poll for pubkey file (written by limguard run on startup)
 			pubkeyPath := DefaultPrivateKeyPath + ".pub"
-			pubKey, err := waitForPubkey(gCtx, nc.ssh, nc.sftp, nc.isRoot, pubkeyPath, 3*time.Second)
+			pubKey, err := waitForPubkey(gCtx, nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, pubkeyPath, 3*time.Second)
 			if err != nil {
 				// Fetch service logs to show what went wrong
 				var serviceLogs string
 				if nc.osName == "linux" {
-					serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "journalctl -u limguard -n 50 --no-pager 2>&1")
+					serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, "journalctl -u limguard -n 50 --no-pager 2>&1")
 				} else {
-					serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, "cat /var/log/system.log | grep limguard | tail -50 2>&1")
+					serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, "cat /var/log/system.log | grep limguard | tail -50 2>&1")
 				}
 				return fmt.Errorf("wait for pubkey on %s: %w\nservice logs:\n%s", name, err, serviceLogs)
 			}
@@ -425,7 +431,7 @@ else
     echo "STARTED"
 fi
 `, tmpCfg, DefaultConfigPath)
-				out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, script)
+				out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, script)
 			} else {
 				plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
 				script := fmt.Sprintf(`
@@ -438,7 +444,7 @@ else
     echo "STARTED"
 fi
 `, tmpCfg, DefaultConfigPath, plistPath)
-				out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, script)
+				out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, script)
 			}
 			if ensureErr != nil {
 				return fmt.Errorf("update config on %s: %w", name, ensureErr)
@@ -500,7 +506,7 @@ fi
 
 				// Ping peer's WireGuard IP
 				pingCmd := fmt.Sprintf("ping -c 3 -W 2 %s", peer.WireguardIP)
-				out, err := runAsRoot(nc.ssh, nc.isRoot, pingCmd)
+				out, err := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, pingCmd)
 				if err != nil {
 					// Gather debug info on ping failure
 					debugInfo := gatherPingDebugInfo(clients, name, peerName, log)
@@ -672,7 +678,9 @@ func sshRun(client *ssh.Client, cmd string) (string, error) {
 
 // runAsRoot runs a shell script as root by piping the script to stdin.
 // This avoids shell quoting issues with the script content.
-func runAsRoot(client *ssh.Client, isRoot bool, script string) (string, error) {
+// If sudoPassword is non-empty and the session is not already root,
+// sudo -S is used and the password is fed via stdin before the script.
+func runAsRoot(client *ssh.Client, isRoot bool, sudoPassword string, script string) (string, error) {
 	sess, err := client.NewSession()
 	if err != nil {
 		return "", err
@@ -682,12 +690,18 @@ func runAsRoot(client *ssh.Client, isRoot bool, script string) (string, error) {
 	var stdout, stderr bytes.Buffer
 	sess.Stdout = &stdout
 	sess.Stderr = &stderr
-	sess.Stdin = strings.NewReader(script)
 
 	cmd := "sh -s"
+	stdinContent := script
 	if !isRoot {
-		cmd = "sudo sh -s"
+		if sudoPassword != "" {
+			cmd = "sudo -S sh -s"
+			stdinContent = sudoPassword + "\n" + script
+		} else {
+			cmd = "sudo sh -s"
+		}
 	}
+	sess.Stdin = strings.NewReader(stdinContent)
 
 	if err := sess.Run(cmd); err != nil {
 		return stdout.String(), fmt.Errorf("%w: %s", err, stderr.String())
@@ -735,7 +749,7 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 
 		// WireGuard status (sudo needed on macOS)
 		wgCmd := "wg show 2>&1 || echo '(wg command not found or failed)'"
-		wgOut, _ := runAsRoot(nc.ssh, nc.isRoot, wgCmd)
+		wgOut, _ := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, wgCmd)
 		sb.WriteString("WireGuard status:\n")
 		sb.WriteString(wgOut)
 		sb.WriteString("\n")
@@ -747,7 +761,7 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 		} else {
 			ifCmd = "ifconfig utun0 2>&1 || ifconfig utun1 2>&1 || ifconfig utun2 2>&1 || echo '(no utun interface found)'"
 		}
-		ifOut, _ := runAsRoot(nc.ssh, nc.isRoot, ifCmd)
+		ifOut, _ := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, ifCmd)
 		sb.WriteString("WireGuard interface:\n")
 		sb.WriteString(ifOut)
 		sb.WriteString("\n")
@@ -759,7 +773,7 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 		} else {
 			logsCmd = "cat /var/log/limguard.log 2>&1 | tail -30 || echo '(no log file found)'"
 		}
-		logsOut, _ := runAsRoot(nc.ssh, nc.isRoot, logsCmd)
+		logsOut, _ := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, logsCmd)
 		sb.WriteString("Service logs:\n")
 		sb.WriteString(logsOut)
 		sb.WriteString("\n")
@@ -771,7 +785,7 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 
 		// WireGuard status
 		wgCmd := "wg show 2>&1 || echo '(wg command not found or failed)'"
-		wgOut, _ := runAsRoot(nc.ssh, nc.isRoot, wgCmd)
+		wgOut, _ := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, wgCmd)
 		sb.WriteString("WireGuard status:\n")
 		sb.WriteString(wgOut)
 		sb.WriteString("\n")
@@ -783,7 +797,7 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 		} else {
 			ifCmd = "ifconfig utun0 2>&1 || ifconfig utun1 2>&1 || ifconfig utun2 2>&1 || echo '(no utun interface found)'"
 		}
-		ifOut, _ := runAsRoot(nc.ssh, nc.isRoot, ifCmd)
+		ifOut, _ := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, ifCmd)
 		sb.WriteString("WireGuard interface:\n")
 		sb.WriteString(ifOut)
 		sb.WriteString("\n")
@@ -793,7 +807,7 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 	return sb.String()
 }
 
-func waitForPubkey(ctx context.Context, sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, path string, timeout time.Duration) (string, error) {
+func waitForPubkey(ctx context.Context, sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, sudoPassword string, path string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		// Check for cancellation
@@ -805,7 +819,7 @@ func waitForPubkey(ctx context.Context, sshClient *ssh.Client, sftpClient *sftp.
 			return strings.TrimSpace(string(data)), nil
 		}
 		// Fall back to shell with sudo if needed (file might be root-owned)
-		if out, err := runAsRoot(sshClient, isRoot, fmt.Sprintf("cat %q 2>/dev/null", path)); err == nil && strings.TrimSpace(out) != "" {
+		if out, err := runAsRoot(sshClient, isRoot, sudoPassword, fmt.Sprintf("cat %q 2>/dev/null", path)); err == nil && strings.TrimSpace(out) != "" {
 			return strings.TrimSpace(out), nil
 		}
 		select {
@@ -928,7 +942,7 @@ func remoteFileSHA256(sshClient *ssh.Client, sftpClient *sftp.Client, path strin
 	return sftpFileSHA256(sftpClient, path)
 }
 
-func installLinuxService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, nodeName string) error {
+func installLinuxService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, sudoPassword string, nodeName string) error {
 	service := fmt.Sprintf(`[Unit]
 Description=limguard WireGuard mesh network manager
 After=network-online.target
@@ -960,11 +974,11 @@ WantedBy=multi-user.target
 	if err := sftpWriteFile(sftpClient, tmpService, []byte(service)); err != nil {
 		return fmt.Errorf("write service file: %w", err)
 	}
-	_, err := runAsRoot(sshClient, isRoot, fmt.Sprintf("mv %s /etc/systemd/system/limguard.service && systemctl daemon-reload && systemctl enable limguard && systemctl restart limguard", tmpService))
+	_, err := runAsRoot(sshClient, isRoot, sudoPassword, fmt.Sprintf("mv %s /etc/systemd/system/limguard.service && systemctl daemon-reload && systemctl enable limguard && systemctl restart limguard", tmpService))
 	return err
 }
 
-func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, nodeName string) error {
+func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, sudoPassword string, nodeName string) error {
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -998,7 +1012,7 @@ func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot
 	if err := sftpWriteFile(sftpClient, tmpPlist, []byte(plist)); err != nil {
 		return fmt.Errorf("write plist file: %w", err)
 	}
-	_, err := runAsRoot(sshClient, isRoot, fmt.Sprintf("launchctl unload %s 2>/dev/null || true; mv %s %s && launchctl load %s", plistPath, tmpPlist, plistPath, plistPath))
+	_, err := runAsRoot(sshClient, isRoot, sudoPassword, fmt.Sprintf("launchctl unload %s 2>/dev/null || true; mv %s %s && launchctl load %s", plistPath, tmpPlist, plistPath, plistPath))
 	return err
 }
 
@@ -1042,7 +1056,7 @@ echo "UNINSTALLED"
 `, ifaceName)
 	}
 
-	out, err := runAsRoot(nc.ssh, nc.isRoot, uninstallScript)
+	out, err := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, uninstallScript)
 	if err != nil {
 		return fmt.Errorf("uninstall script failed: %w", err)
 	}

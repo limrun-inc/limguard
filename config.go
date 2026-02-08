@@ -32,10 +32,11 @@ const DefaultDarwinInterfaceName = "utun9"
 
 // SSH holds SSH connection details for a node (used only by deploy command).
 type SSH struct {
-	Host         string `yaml:"host"`
-	Port         int    `yaml:"port,omitempty"`
-	User         string `yaml:"user,omitempty"`
-	IdentityFile string `yaml:"identityFile,omitempty"`
+	Host         string  `yaml:"host"`
+	Port         int     `yaml:"port,omitempty"`
+	User         string  `yaml:"user,omitempty"`
+	IdentityFile string  `yaml:"identityFile,omitempty"`
+	SudoPassword *string `yaml:"sudoPassword,omitempty"`
 }
 
 // NodeAction represents the desired action for a node.
@@ -50,7 +51,7 @@ const (
 
 // Node represents a node in the WireGuard mesh.
 type Node struct {
-	Action          NodeAction `yaml:"action,omitempty"`          // Apply (default) or Delete
+	Action          NodeAction `yaml:"action,omitempty"` // Apply (default) or Delete
 	WireguardIP     string     `yaml:"wireguardIP"`
 	Endpoint        string     `yaml:"endpoint"`                  // Must be host:port format
 	PublicKey       string     `yaml:"publicKey,omitempty"`       // Filled in after bootstrap
