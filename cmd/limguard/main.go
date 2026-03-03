@@ -31,6 +31,8 @@ func run() int {
 		err = limguard.Run(ctx, os.Args[2:], nil)
 	case "apply":
 		err = limguard.Apply(ctx, os.Args[2:], nil)
+	case "validate":
+		err = limguard.Validate(ctx, os.Args[2:], nil)
 	case "version":
 		fmt.Println(limguard.Version)
 		return 0
@@ -58,6 +60,7 @@ func usage() {
 Commands:
   run        Run the daemon (bootstraps if needed)
   apply      Deploy to nodes via SSH
+  validate   Validate mesh connectivity with ping checks
   version    Print version
 
 Use "limguard <command> --help" for more information about a command.`)

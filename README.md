@@ -93,6 +93,7 @@ nodes:
 
 ```bash
 limguard apply --config limguard.yaml   # Deploy to all nodes
+limguard validate --config limguard.yaml  # Validate mesh connectivity only
 limguard run --config /etc/limguard/limguard.yaml  # Run daemon
 limguard version  # Print version
 ```

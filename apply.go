@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"text/template"
@@ -475,54 +476,7 @@ fi
 	case <-time.After(2 * time.Second):
 	}
 
-	g3, g3Ctx := errgroup.WithContext(ctx)
-	for name := range cfg.Nodes {
-		name := name // capture loop variable
-		node := cfg.Nodes[name]
-		nc := clients[name]
-
-		// Skip deleted nodes and local nodes
-		if node.IsDelete() || nc.local {
-			continue
-		}
-
-		g3.Go(func() error {
-			// Check for cancellation
-			if g3Ctx.Err() != nil {
-				return g3Ctx.Err()
-			}
-			// Ping all remote peers from this node (skip deleted peers and local peers)
-			for peerName, peer := range cfg.Nodes {
-				if peerName == name {
-					continue // skip self
-				}
-				if peer.IsDelete() {
-					continue // skip deleted peers
-				}
-				// Skip local peers - they're not connected yet
-				if isLocalNode(peer) {
-					continue
-				}
-
-				// Ping peer's WireGuard IP
-				pingCmd := fmt.Sprintf("ping -c 3 -W 2 %s", peer.WireguardIP)
-				out, err := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, pingCmd)
-				if err != nil {
-					// Gather debug info on ping failure
-					debugInfo := gatherPingDebugInfo(clients, name, peerName, log)
-					return fmt.Errorf("ping from %s (%s) to %s (%s) failed: %w\n\n%s",
-						name, node.WireguardIP, peerName, peer.WireguardIP, err, debugInfo)
-				}
-
-				// Parse latency from ping output (e.g., "rtt min/avg/max/mdev = 0.1/0.2/0.3/0.0 ms")
-				latency := parsePingLatency(out)
-				log.Info("ping ok", "from", name, "to", peerName, "ip", peer.WireguardIP, "latency", latency)
-			}
-			return nil
-		})
-	}
-
-	if err := g3.Wait(); err != nil {
+	if err := validateMeshConnectivity(ctx, cfg, clients, log); err != nil {
 		return err
 	}
 
@@ -692,11 +646,13 @@ func runAsRoot(client *ssh.Client, isRoot bool, sudoPassword string, script stri
 	sess.Stderr = &stderr
 
 	cmd := "sh -s"
-	stdinContent := script
+	// Ensure common binary locations are available in non-interactive shells.
+	pathPrefix := "export PATH=/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\n"
+	stdinContent := pathPrefix + script
 	if !isRoot {
 		if sudoPassword != "" {
 			cmd = "sudo -S sh -s"
-			stdinContent = sudoPassword + "\n" + script
+			stdinContent = sudoPassword + "\n" + pathPrefix + script
 		} else {
 			cmd = "sudo sh -s"
 		}
@@ -736,6 +692,254 @@ func parsePingLatency(output string) string {
 		}
 	}
 	return "unknown"
+}
+
+// validateMeshConnectivity pings every remote peer from every remote node.
+func validateMeshConnectivity(ctx context.Context, cfg *Config, clients map[string]*nodeConn, log *slog.Logger) error {
+	g, gCtx := errgroup.WithContext(ctx)
+	for name := range cfg.Nodes {
+		name := name
+		node := cfg.Nodes[name]
+		nc := clients[name]
+
+		// Skip deleted nodes and local nodes.
+		if node.IsDelete() || nc.local {
+			continue
+		}
+
+		g.Go(func() error {
+			if gCtx.Err() != nil {
+				return gCtx.Err()
+			}
+
+			// Ping all remote peers from this node.
+			for peerName, peer := range cfg.Nodes {
+				if peerName == name {
+					continue
+				}
+				if peer.IsDelete() || isLocalNode(peer) {
+					continue
+				}
+
+				pingCmd := fmt.Sprintf("ping -c 3 -W 2 %s", peer.WireguardIP)
+				out, err := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, pingCmd)
+				if err != nil {
+					debugInfo := gatherPingDebugInfo(clients, name, peerName, log)
+					return fmt.Errorf("ping from %s (%s) to %s (%s) failed: %w\n\n%s",
+						name, node.WireguardIP, peerName, peer.WireguardIP, err, debugInfo)
+				}
+
+				latency := parsePingLatency(out)
+				log.Info("ping ok", "from", name, "to", peerName, "ip", peer.WireguardIP, "latency", latency)
+			}
+			return nil
+		})
+	}
+
+	return g.Wait()
+}
+
+// validateAllowedIPs checks that each node has:
+// 1) the expected peers,
+// 2) each peer's base WireGuard IP (/32 or /128),
+// 3) dynamically propagated CIDRs consistent across nodes for each peer.
+func validateAllowedIPs(ctx context.Context, cfg *Config, clients map[string]*nodeConn) error {
+	type nodeAllowedIPsSnapshot struct {
+		iface string
+		peers map[string]map[string]bool // peer pubkey -> allowed CIDRs
+	}
+
+	snapshots := make(map[string]nodeAllowedIPsSnapshot)
+	var snapshotsMu sync.Mutex
+
+	g, gCtx := errgroup.WithContext(ctx)
+	for name := range cfg.Nodes {
+		name := name
+		node := cfg.Nodes[name]
+		nc := clients[name]
+
+		// Skip deleted nodes and local nodes.
+		if node.IsDelete() || nc.local {
+			continue
+		}
+
+		g.Go(func() error {
+			if gCtx.Err() != nil {
+				return gCtx.Err()
+			}
+
+			iface := interfaceNameForNode(cfg, name, nc.osName)
+			out, err := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, fmt.Sprintf("wg show %q allowed-ips", iface))
+			if err != nil {
+				return fmt.Errorf("read allowed-ips on %s (%s): %w", name, iface, err)
+			}
+
+			snapshotsMu.Lock()
+			snapshots[name] = nodeAllowedIPsSnapshot{
+				iface: iface,
+				peers: parseWGAllowedIPs(out),
+			}
+			snapshotsMu.Unlock()
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	// Build expected base CIDR for each known peer public key.
+	baseCIDRByPeer := make(map[string]string)
+	for _, peer := range cfg.Nodes {
+		if peer.IsDelete() || peer.PublicKey == "" {
+			continue
+		}
+		baseCIDRByPeer[peer.PublicKey] = expectedNodeAllowedIP(peer.WireguardIP)
+	}
+
+	// Build global set of dynamic CIDRs seen for each peer (base /32 excluded).
+	// If any node sees routed CIDRs for a peer, all nodes should converge to include them.
+	dynamicCIDRsByPeer := make(map[string]map[string]bool)
+	for _, snapshot := range snapshots {
+		for pubKey, allowedIPs := range snapshot.peers {
+			baseCIDR := baseCIDRByPeer[pubKey]
+			for cidr := range allowedIPs {
+				if baseCIDR != "" && cidr == baseCIDR {
+					continue
+				}
+				if _, ok := dynamicCIDRsByPeer[pubKey]; !ok {
+					dynamicCIDRsByPeer[pubKey] = make(map[string]bool)
+				}
+				dynamicCIDRsByPeer[pubKey][cidr] = true
+			}
+		}
+	}
+
+	for nodeName := range cfg.Nodes {
+		node := cfg.Nodes[nodeName]
+		nc := clients[nodeName]
+		if node.IsDelete() || nc.local {
+			continue
+		}
+
+		snapshot, ok := snapshots[nodeName]
+		if !ok {
+			return fmt.Errorf("internal error: no allowed-ips snapshot for %s", nodeName)
+		}
+		actual := snapshot.peers
+
+		expectedPeers := make(map[string]bool)
+		for peerName, peer := range cfg.Nodes {
+			if peerName == nodeName || peer.IsDelete() || peer.PublicKey == "" {
+				continue
+			}
+			expectedPeers[peer.PublicKey] = true
+		}
+
+		var missingPeers []string
+		var missingBaseAllowedIPs []string
+		var missingDynamicAllowedIPs []string
+		var unexpectedPeers []string
+
+		for pubKey := range expectedPeers {
+			gotAllowedIPs, exists := actual[pubKey]
+			if !exists {
+				missingPeers = append(missingPeers, pubKey)
+				continue
+			}
+
+			baseCIDR := baseCIDRByPeer[pubKey]
+			if baseCIDR != "" && !gotAllowedIPs[baseCIDR] {
+				missingBaseAllowedIPs = append(missingBaseAllowedIPs, fmt.Sprintf("%s=>%s", pubKey, baseCIDR))
+			}
+
+			for dynamicCIDR := range dynamicCIDRsByPeer[pubKey] {
+				if !gotAllowedIPs[dynamicCIDR] {
+					missingDynamicAllowedIPs = append(missingDynamicAllowedIPs, fmt.Sprintf("%s=>%s", pubKey, dynamicCIDR))
+				}
+			}
+		}
+
+		for pubKey := range actual {
+			if !expectedPeers[pubKey] {
+				unexpectedPeers = append(unexpectedPeers, pubKey)
+			}
+		}
+
+		sort.Strings(missingPeers)
+		sort.Strings(missingBaseAllowedIPs)
+		sort.Strings(missingDynamicAllowedIPs)
+		sort.Strings(unexpectedPeers)
+
+		if len(missingPeers) == 0 && len(missingBaseAllowedIPs) == 0 && len(missingDynamicAllowedIPs) == 0 && len(unexpectedPeers) == 0 {
+			continue
+		}
+
+		return fmt.Errorf(
+			"allowed-ips mismatch on %s (%s): missing peers=%v missing base allowed-ips=%v missing routed allowed-ips=%v unexpected peers=%v",
+			nodeName, snapshot.iface, missingPeers, missingBaseAllowedIPs, missingDynamicAllowedIPs, unexpectedPeers,
+		)
+	}
+
+	return nil
+}
+
+func parseWGAllowedIPs(output string) map[string]map[string]bool {
+	result := make(map[string]map[string]bool)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		pubKey := fields[0]
+		allowedRaw := strings.TrimSpace(strings.Join(fields[1:], " "))
+
+		if _, ok := result[pubKey]; !ok {
+			result[pubKey] = make(map[string]bool)
+		}
+
+		if allowedRaw == "(none)" || allowedRaw == "" {
+			continue
+		}
+
+		// `wg show <iface> allowed-ips` output differs by tooling/version:
+		// some emit comma-separated CIDRs, others space-separated.
+		normalized := strings.ReplaceAll(allowedRaw, ",", " ")
+		for _, cidr := range strings.Fields(normalized) {
+			cidr = strings.TrimSpace(cidr)
+			if cidr == "" {
+				continue
+			}
+			result[pubKey][cidr] = true
+		}
+	}
+	return result
+}
+
+func expectedNodeAllowedIP(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ip + "/32"
+	}
+	if parsed.To4() != nil {
+		return parsed.String() + "/32"
+	}
+	return parsed.String() + "/128"
+}
+
+func interfaceNameForNode(cfg *Config, nodeName, nodeOS string) string {
+	if node, ok := cfg.Nodes[nodeName]; ok && node.InterfaceName != "" {
+		return node.InterfaceName
+	}
+	if nodeOS == "darwin" {
+		return cfg.DarwinInterfaceName
+	}
+	return cfg.LinuxInterfaceName
 }
 
 // gatherPingDebugInfo collects debug information when a ping fails between remote nodes.
