@@ -300,61 +300,81 @@ func Apply(ctx context.Context, args []string, log *slog.Logger) error {
 				if err := sftpCopyFile(nc.sftp, srcBinaryPath, tmpBinary); err != nil {
 					return fmt.Errorf("copy binary to %s: %w", name, err)
 				}
+				if _, err := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, fmt.Sprintf(`mv /tmp/limguard-binary %s && chmod 755 %s`, DefaultBinaryPath, DefaultBinaryPath)); err != nil {
+					return fmt.Errorf("failed to move binary from %s to %s: %w", tmpBinary, DefaultBinaryPath, err)
+				}
 			} else {
 				log.Info("binary unchanged", "node", name, "sha256", srcHash[:8])
 			}
 
-			// Write minimal config for this node (empty publicKey to skip validation during bootstrap)
-			minCfg := &Config{
-				LinuxInterfaceName:  cfg.LinuxInterfaceName,
-				DarwinInterfaceName: cfg.DarwinInterfaceName,
-				Nodes:               map[string]Node{name: {WireguardIP: node.WireguardIP, Endpoint: node.Endpoint, PublicKey: "", InterfaceName: node.InterfaceName}},
-			}
-			tmpCfg := "/tmp/limguard-bootstrap.yaml"
-			cfgData, err := minCfg.ToYAML()
-			if err != nil {
-				return fmt.Errorf("marshal config for %s: %w", name, err)
-			}
-			if err := sftpWriteFile(nc.sftp, tmpCfg, cfgData); err != nil {
-				return fmt.Errorf("write config to %s: %w", name, err)
+			pubkeyPath := DefaultPrivateKeyPath + ".pub"
+			var pubKey string
+			if _, err := sftpReadFile(nc.sftp, DefaultConfigPath); err == nil {
+				if data, err := sftpReadFile(nc.sftp, pubkeyPath); err == nil {
+					pubKey = strings.TrimSpace(string(data))
+				}
 			}
 
-			// Run all privileged operations in a single bash session (elevated if needed)
-			setupScript := fmt.Sprintf(`
+			if pubKey != "" {
+				log.Info("reusing existing bootstrap state", "node", name, "publicKey", pubKey)
+			} else {
+				log.Info("no existing bootstrap state found, writing new config", "node", name)
+				// Write minimal config for this node (empty publicKey to skip validation during bootstrap)
+				minCfg := &Config{
+					LinuxInterfaceName:  cfg.LinuxInterfaceName,
+					DarwinInterfaceName: cfg.DarwinInterfaceName,
+					Nodes: map[string]Node{
+						name: {
+							WireguardIP:   node.WireguardIP,
+							Endpoint:      node.Endpoint,
+							PublicKey:     "",
+							InterfaceName: node.InterfaceName,
+						},
+					},
+				}
+				tmpCfg := "/tmp/limguard-bootstrap.yaml"
+				cfgData, err := minCfg.ToYAML()
+				if err != nil {
+					return fmt.Errorf("marshal config for %s: %w", name, err)
+				}
+				if err := sftpWriteFile(nc.sftp, tmpCfg, cfgData); err != nil {
+					return fmt.Errorf("write config to %s: %w", name, err)
+				}
+
+				// Only bootstrap nodes missing the config or public key.
+				setupScript := fmt.Sprintf(`
 mkdir -p %s %s
-if [ -f /tmp/limguard-binary ]; then mv /tmp/limguard-binary %s && chmod 755 %s; fi
 mv %s %s
 `, filepath.Dir(DefaultConfigPath), filepath.Dir(DefaultPrivateKeyPath),
-				DefaultBinaryPath, DefaultBinaryPath,
-				tmpCfg, DefaultConfigPath)
+					tmpCfg, DefaultConfigPath)
 
-			if _, err := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, setupScript); err != nil {
-				return fmt.Errorf("setup node %s: %w", name, err)
-			}
-
-			// Install and start service (runs limguard run, which bootstraps if needed)
-			if nc.osName == "linux" {
-				if err := installLinuxService(nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, name); err != nil {
-					return fmt.Errorf("install linux service on %s: %w", name, err)
+				if _, err := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, setupScript); err != nil {
+					return fmt.Errorf("setup node %s: %w", name, err)
 				}
-			} else {
-				if err := installDarwinService(nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, name); err != nil {
-					return fmt.Errorf("install darwin service on %s: %w", name, err)
-				}
-			}
 
-			// Poll for pubkey file (written by limguard run on startup)
-			pubkeyPath := DefaultPrivateKeyPath + ".pub"
-			pubKey, err := waitForPubkey(gCtx, nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, pubkeyPath, 3*time.Second)
-			if err != nil {
-				// Fetch service logs to show what went wrong
-				var serviceLogs string
+				// Install and start service (runs limguard run, which bootstraps if needed)
 				if nc.osName == "linux" {
-					serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, "journalctl -u limguard -n 50 --no-pager 2>&1")
+					if err := installLinuxService(nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, name); err != nil {
+						return fmt.Errorf("install linux service on %s: %w", name, err)
+					}
 				} else {
-					serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, "cat /var/log/system.log | grep limguard | tail -50 2>&1")
+					if err := installDarwinService(nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, name); err != nil {
+						return fmt.Errorf("install darwin service on %s: %w", name, err)
+					}
 				}
-				return fmt.Errorf("wait for pubkey on %s: %w\nservice logs:\n%s", name, err, serviceLogs)
+
+				// Poll for pubkey file (written by limguard run on startup)
+				pubKey, err = waitForPubkey(gCtx, nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, pubkeyPath, 3*time.Second)
+				if err != nil {
+					// Fetch service logs to show what went wrong
+					var serviceLogs string
+					if nc.osName == "linux" {
+						serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, "journalctl -u limguard -n 50 --no-pager 2>&1")
+					} else {
+						serviceLogs, _ = runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, "cat /var/log/system.log | grep limguard | tail -50 2>&1")
+					}
+					return fmt.Errorf("wait for pubkey on %s: %w\nservice logs:\n%s", name, err, serviceLogs)
+				}
 			}
 
 			pkMu.Lock()
