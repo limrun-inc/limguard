@@ -98,7 +98,7 @@ func Validate(ctx context.Context, args []string, log *slog.Logger) error {
 	}
 
 	log.Info("validating wireguard allowed-ips")
-	if err := validateAllowedIPs(ctx, cfg, clients); err != nil {
+	if err := validateAllowedIPs(ctx, cfg, clients, log); err != nil {
 		return err
 	}
 

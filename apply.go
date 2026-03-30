@@ -742,9 +742,9 @@ func validateMeshConnectivity(ctx context.Context, cfg *Config, clients map[stri
 				}
 
 				pingCmd := fmt.Sprintf("ping -c 3 -W 2 %s", peer.WireguardIP)
-				out, err := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, pingCmd)
+				out, err := sshRun(nc.ssh, pingCmd)
 				if err != nil {
-					debugInfo := gatherPingDebugInfo(clients, name, peerName, log)
+					debugInfo := gatherPingDebugInfo(cfg, clients, name, peerName, log)
 					return fmt.Errorf("ping from %s (%s) to %s (%s) failed: %w\n\n%s",
 						name, node.WireguardIP, peerName, peer.WireguardIP, err, debugInfo)
 				}
@@ -763,7 +763,9 @@ func validateMeshConnectivity(ctx context.Context, cfg *Config, clients map[stri
 // 1) the expected peers,
 // 2) each peer's base WireGuard IP (/32 or /128),
 // 3) dynamically propagated CIDRs consistent across nodes for each peer.
-func validateAllowedIPs(ctx context.Context, cfg *Config, clients map[string]*nodeConn) error {
+func validateAllowedIPs(ctx context.Context, cfg *Config, clients map[string]*nodeConn, log *slog.Logger) error {
+	const sharedServiceCIDR = "10.96.0.0/12"
+
 	type nodeAllowedIPsSnapshot struct {
 		iface string
 		peers map[string]map[string]bool // peer pubkey -> allowed CIDRs
@@ -810,11 +812,17 @@ func validateAllowedIPs(ctx context.Context, cfg *Config, clients map[string]*no
 
 	// Build expected base CIDR for each known peer public key.
 	baseCIDRByPeer := make(map[string]string)
-	for _, peer := range cfg.Nodes {
+	peerNameByPublicKey := make(map[string]string)
+	peerOSByPublicKey := make(map[string]string)
+	for peerName, peer := range cfg.Nodes {
 		if peer.IsDelete() || peer.PublicKey == "" {
 			continue
 		}
 		baseCIDRByPeer[peer.PublicKey] = expectedNodeAllowedIP(peer.WireguardIP)
+		peerNameByPublicKey[peer.PublicKey] = peerName
+		if nc, ok := clients[peerName]; ok {
+			peerOSByPublicKey[peer.PublicKey] = nc.osName
+		}
 	}
 
 	// Build global set of dynamic CIDRs seen for each peer (base /32 excluded).
@@ -825,6 +833,9 @@ func validateAllowedIPs(ctx context.Context, cfg *Config, clients map[string]*no
 			baseCIDR := baseCIDRByPeer[pubKey]
 			for cidr := range allowedIPs {
 				if baseCIDR != "" && cidr == baseCIDR {
+					continue
+				}
+				if cidr == sharedServiceCIDR {
 					continue
 				}
 				if _, ok := dynamicCIDRsByPeer[pubKey]; !ok {
@@ -875,6 +886,19 @@ func validateAllowedIPs(ctx context.Context, cfg *Config, clients map[string]*no
 
 			for dynamicCIDR := range dynamicCIDRsByPeer[pubKey] {
 				if !gotAllowedIPs[dynamicCIDR] {
+					// Current BGP design only propagates Linux node CIDRs to macOS nodes.
+					// Missing routed CIDRs from macOS peers on macOS validators are expected for now.
+					if nc.osName == "darwin" && peerOSByPublicKey[pubKey] == "darwin" {
+						log.Warn(
+							"ignoring missing macOS routed allowed-ips on macOS node",
+							"node", nodeName,
+							"iface", snapshot.iface,
+							"peer", peerNameByPublicKey[pubKey],
+							"peerPublicKey", pubKey,
+							"cidr", dynamicCIDR,
+						)
+						continue
+					}
 					missingDynamicAllowedIPs = append(missingDynamicAllowedIPs, fmt.Sprintf("%s=>%s", pubKey, dynamicCIDR))
 				}
 			}
@@ -963,7 +987,7 @@ func interfaceNameForNode(cfg *Config, nodeName, nodeOS string) string {
 }
 
 // gatherPingDebugInfo collects debug information when a ping fails between remote nodes.
-func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, log *slog.Logger) string {
+func gatherPingDebugInfo(cfg *Config, clients map[string]*nodeConn, srcNode, dstNode string, log *slog.Logger) string {
 	var sb strings.Builder
 	sb.WriteString("=== DEBUG INFO ===\n")
 
@@ -978,12 +1002,13 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 		sb.WriteString(wgOut)
 		sb.WriteString("\n")
 
-		// Network interfaces (to see if wg0 exists)
+		// Network interface state
 		var ifCmd string
+		iface := interfaceNameForNode(cfg, srcNode, nc.osName)
 		if nc.osName == "linux" {
-			ifCmd = "ip addr show wg0 2>&1 || echo '(wg0 interface not found)'"
+			ifCmd = fmt.Sprintf("ip addr show %q 2>&1 || echo '(%s interface not found)'", iface, iface)
 		} else {
-			ifCmd = "ifconfig utun0 2>&1 || ifconfig utun1 2>&1 || ifconfig utun2 2>&1 || echo '(no utun interface found)'"
+			ifCmd = fmt.Sprintf("ifconfig %q 2>&1 || echo '(%s interface not found)'", iface, iface)
 		}
 		ifOut, _ := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, ifCmd)
 		sb.WriteString("WireGuard interface:\n")
@@ -1014,12 +1039,13 @@ func gatherPingDebugInfo(clients map[string]*nodeConn, srcNode, dstNode string, 
 		sb.WriteString(wgOut)
 		sb.WriteString("\n")
 
-		// Network interfaces
+		// Network interface state
 		var ifCmd string
+		iface := interfaceNameForNode(cfg, dstNode, nc.osName)
 		if nc.osName == "linux" {
-			ifCmd = "ip addr show wg0 2>&1 || echo '(wg0 interface not found)'"
+			ifCmd = fmt.Sprintf("ip addr show %q 2>&1 || echo '(%s interface not found)'", iface, iface)
 		} else {
-			ifCmd = "ifconfig utun0 2>&1 || ifconfig utun1 2>&1 || ifconfig utun2 2>&1 || echo '(no utun interface found)'"
+			ifCmd = fmt.Sprintf("ifconfig %q 2>&1 || echo '(%s interface not found)'", iface, iface)
 		}
 		ifOut, _ := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, ifCmd)
 		sb.WriteString("WireGuard interface:\n")
