@@ -403,6 +403,24 @@ mv %s %s
 	}
 	log.Info("updated local config with public keys")
 
+	// If there's a local node, write WireGuard config as soon as all peer keys are known.
+	// Remote distribution and validation can still fail, but the local config is ready here.
+	if localNodeName != "" && localPrivateKey != "" {
+		localNode := cfg.Nodes[localNodeName]
+		wgConfig := generateWireGuardConfig(cfg, localNodeName, localNode, localPrivateKey)
+
+		// Determine output path (default: <node-name>-peer.conf)
+		wgConfPath := opts.LocalWGConfPath
+		if wgConfPath == "" {
+			wgConfPath = localNodeName + "-peer.conf"
+		}
+
+		if err := os.WriteFile(wgConfPath, []byte(wgConfig), 0600); err != nil {
+			return fmt.Errorf("write WireGuard config: %w", err)
+		}
+		log.Info("WireGuard config written", "path", wgConfPath, "node", localNodeName)
+	}
+
 	// Pass 2: Distribute full config (in parallel)
 	// If service is running, limguard will pick up the config change via file watcher.
 	// If not running, start the service.
@@ -501,23 +519,6 @@ fi
 	}
 
 	log.Info("deployment complete - mesh connectivity verified")
-
-	// If there's a local node, write WireGuard config to file for GUI apps
-	if localNodeName != "" && localPrivateKey != "" {
-		localNode := cfg.Nodes[localNodeName]
-		wgConfig := generateWireGuardConfig(cfg, localNodeName, localNode, localPrivateKey)
-
-		// Determine output path (default: <node-name>-peer.conf)
-		wgConfPath := opts.LocalWGConfPath
-		if wgConfPath == "" {
-			wgConfPath = localNodeName + "-peer.conf"
-		}
-
-		if err := os.WriteFile(wgConfPath, []byte(wgConfig), 0600); err != nil {
-			return fmt.Errorf("write WireGuard config: %w", err)
-		}
-		log.Info("WireGuard config written", "path", wgConfPath, "node", localNodeName)
-	}
 
 	return nil
 }
@@ -741,7 +742,7 @@ func validateMeshConnectivity(ctx context.Context, cfg *Config, clients map[stri
 					continue
 				}
 
-				pingCmd := fmt.Sprintf("ping -c 3 -W 2 %s", peer.WireguardIP)
+				pingCmd := pingCommand(nc.osName, peer.WireguardIP)
 				out, err := sshRun(nc.ssh, pingCmd)
 				if err != nil {
 					debugInfo := gatherPingDebugInfo(cfg, clients, name, peerName, log)
@@ -757,6 +758,13 @@ func validateMeshConnectivity(ctx context.Context, cfg *Config, clients map[stri
 	}
 
 	return g.Wait()
+}
+
+func pingCommand(osName, ip string) string {
+	if osName == "darwin" {
+		return fmt.Sprintf("ping -c 3 -W 2000 %s", ip)
+	}
+	return fmt.Sprintf("ping -c 3 -W 2 %s", ip)
 }
 
 // validateAllowedIPs checks that each node has:
