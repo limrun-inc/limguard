@@ -47,33 +47,11 @@ func NewNetworkManager(iface, privateKeyPath string, listenPort int, wireguardIP
 		}
 	}()
 
-	// Create interface if needed
-	if _, err := exec.CommandContext(ctx, "ifconfig", iface).Output(); err != nil {
-		out, err := exec.CommandContext(ctx, "/opt/homebrew/bin/wireguard-go", iface).CombinedOutput()
-		if err != nil {
-			return nil, fmt.Errorf("create interface: %s: %w", out, err)
-		}
-
-		// Wait for interface to become available (cancellable)
-		available := false
-		for i := 0; i < 20; i++ {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			if _, err := exec.CommandContext(ctx, "ifconfig", iface).Output(); err == nil {
-				available = true
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(500 * time.Millisecond):
-			}
-		}
-		if !available {
-			return nil, fmt.Errorf("interface %s not available after wireguard-go started", iface)
-		}
-
+	// The utun is owned by a dedicated launchd-managed wireguard-go service.
+	// limguard only configures the existing interface so limguard restarts do
+	// not flap the tunnel underneath BGP consumers such as macnode.
+	if out, err := exec.CommandContext(ctx, "ifconfig", iface).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("wireguard interface %s is not available; run limguard apply to install/start wireguard-go service: %s: %w", iface, out, err)
 	}
 
 	// Add IP address

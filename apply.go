@@ -358,6 +358,10 @@ mv %s %s
 						return fmt.Errorf("install linux service on %s: %w", name, err)
 					}
 				} else {
+					ifaceName := interfaceNameForNode(cfg, name, nc.osName)
+					if err := installDarwinWireguardService(nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, ifaceName); err != nil {
+						return fmt.Errorf("install darwin wireguard service on %s: %w", name, err)
+					}
 					if err := installDarwinService(nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, name); err != nil {
 						return fmt.Errorf("install darwin service on %s: %w", name, err)
 					}
@@ -472,6 +476,10 @@ fi
 `, tmpCfg, DefaultConfigPath)
 				out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, script)
 			} else {
+				ifaceName := interfaceNameForNode(cfg, name, nc.osName)
+				if err := installDarwinWireguardService(nc.ssh, nc.sftp, nc.isRoot, nc.sudoPassword, ifaceName); err != nil {
+					return fmt.Errorf("ensure darwin wireguard service on %s: %w", name, err)
+				}
 				plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
 				script := fmt.Sprintf(`
 mv %s %s
@@ -1274,6 +1282,91 @@ func installDarwinService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot
 	return err
 }
 
+func installDarwinWireguardService(sshClient *ssh.Client, sftpClient *sftp.Client, isRoot bool, sudoPassword, iface string) error {
+	label := fmt.Sprintf("com.limrun.limguard.wireguard-go.%s", iface)
+	plistPath := fmt.Sprintf("/Library/LaunchDaemons/%s.plist", label)
+	tmpPlist := fmt.Sprintf("/tmp/%s.plist", label)
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>%s</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/wireguard-go</string>
+        <string>-f</string>
+        <string>%s</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/wireguard-go-%s.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/wireguard-go-%s.log</string>
+</dict>
+</plist>
+`, label, iface, iface, iface)
+
+	if err := sftpWriteFile(sftpClient, tmpPlist, []byte(plist)); err != nil {
+		return fmt.Errorf("write wireguard-go plist file: %w", err)
+	}
+
+	script := fmt.Sprintf(`
+set -e
+label=%q
+plist=%q
+tmp=%q
+iface=%q
+
+if [ ! -f "$plist" ] || ! cmp -s "$tmp" "$plist"; then
+    if launchctl print "system/$label" >/dev/null 2>&1; then
+        launchctl bootout system "$plist" 2>/dev/null || launchctl unload "$plist" 2>/dev/null || true
+    fi
+    mv "$tmp" "$plist"
+    chown root:wheel "$plist"
+    chmod 644 "$plist"
+else
+    rm -f "$tmp"
+fi
+
+if ! launchctl print "system/$label" >/dev/null 2>&1; then
+    if ifconfig "$iface" >/dev/null 2>&1 && launchctl list | grep -q '^.*com\.limrun\.limguard$'; then
+        # Migration path: old limguard-owned wireguard-go is holding the utun.
+        # Stop limguard once so the dedicated wireguard-go service can own it.
+        launchctl bootout system /Library/LaunchDaemons/com.limrun.limguard.plist 2>/dev/null || launchctl unload /Library/LaunchDaemons/com.limrun.limguard.plist 2>/dev/null || true
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            if ! ifconfig "$iface" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 0.5
+        done
+    fi
+    launchctl bootstrap system "$plist" 2>/dev/null || launchctl load "$plist"
+fi
+launchctl kickstart "system/$label" 2>/dev/null || true
+
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if ifconfig "$iface" >/dev/null 2>&1; then
+        echo "READY"
+        exit 0
+    fi
+    sleep 0.5
+done
+
+echo "wireguard interface $iface did not become ready" >&2
+exit 1
+`, label, plistPath, tmpPlist, iface)
+
+	out, err := runAsRoot(sshClient, isRoot, sudoPassword, script)
+	if err != nil {
+		return fmt.Errorf("ensure wireguard-go service: %w: %s", err, out)
+	}
+	return nil
+}
+
 // isLocalNode returns true if the node is marked as local (ssh.host: self).
 func isLocalNode(node Node) bool {
 	return node.SSH != nil && strings.EqualFold(node.SSH.Host, "self")
@@ -1304,14 +1397,18 @@ echo "UNINSTALLED"
 	} else {
 		// macOS
 		// Note: utun interfaces are owned by wireguard-go; killing it removes the interface
+		wgLabel := fmt.Sprintf("com.limrun.limguard.wireguard-go.%s", ifaceName)
+		wgPlistPath := fmt.Sprintf("/Library/LaunchDaemons/%s.plist", wgLabel)
 		uninstallScript = fmt.Sprintf(`
 launchctl unload /Library/LaunchDaemons/com.limrun.limguard.plist 2>/dev/null || true
 rm -f /Library/LaunchDaemons/com.limrun.limguard.plist
+launchctl bootout system %s 2>/dev/null || launchctl unload %s 2>/dev/null || true
+rm -f %s
 pkill -f "wireguard-go %s" 2>/dev/null || true
 rm -f /etc/limguard/limguard.yaml /etc/limguard/privatekey /etc/limguard/privatekey.pub
 rmdir /etc/limguard 2>/dev/null || true
 echo "UNINSTALLED"
-`, ifaceName)
+`, wgPlistPath, wgPlistPath, wgPlistPath, ifaceName)
 	}
 
 	out, err := runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, uninstallScript)
