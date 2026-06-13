@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -483,14 +484,14 @@ fi
 				plistPath := "/Library/LaunchDaemons/com.limrun.limguard.plist"
 				script := fmt.Sprintf(`
 mv %s %s
-if launchctl list | grep -q com.limrun.limguard; then
+if launchctl print system/com.limrun.limguard >/dev/null 2>&1; then
     launchctl kickstart -k system/com.limrun.limguard
     echo "RESTARTED"
 else
-    launchctl load %s
+    launchctl bootstrap system %s 2>/dev/null || launchctl load %s
     echo "STARTED"
 fi
-`, tmpCfg, DefaultConfigPath, plistPath)
+`, tmpCfg, DefaultConfigPath, plistPath, plistPath)
 				out, ensureErr = runAsRoot(nc.ssh, nc.isRoot, nc.sudoPassword, script)
 			}
 			if ensureErr != nil {
@@ -659,6 +660,10 @@ func sshRun(client *ssh.Client, cmd string) (string, error) {
 	return stdout.String(), nil
 }
 
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
 // runAsRoot runs a shell script as root by piping the script to stdin.
 // This avoids shell quoting issues with the script content.
 // If sudoPassword is non-empty and the session is not already root,
@@ -694,35 +699,6 @@ func runAsRoot(client *ssh.Client, isRoot bool, sudoPassword string, script stri
 	return stdout.String(), nil
 }
 
-// parsePingLatency extracts the average latency from ping output.
-// Returns the avg latency string (e.g., "1.234 ms") or "unknown" if parsing fails.
-func parsePingLatency(output string) string {
-	// Linux format: rtt min/avg/max/mdev = 0.123/0.456/0.789/0.012 ms
-	// macOS format: round-trip min/avg/max/stddev = 0.123/0.456/0.789/0.012 ms
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "min/avg/max") {
-			// Find the = and parse the values after it
-			parts := strings.Split(line, "=")
-			if len(parts) < 2 {
-				continue
-			}
-			stats := strings.TrimSpace(parts[1])
-			// stats is like "0.123/0.456/0.789/0.012 ms"
-			fields := strings.Fields(stats)
-			if len(fields) < 2 {
-				continue
-			}
-			values := strings.Split(fields[0], "/")
-			unit := fields[1]
-			if len(values) >= 2 {
-				return values[1] + " " + unit // avg value
-			}
-		}
-	}
-	return "unknown"
-}
-
 // validateMeshConnectivity pings every remote peer from every remote node.
 func validateMeshConnectivity(ctx context.Context, cfg *Config, clients map[string]*nodeConn, log *slog.Logger) error {
 	g, gCtx := errgroup.WithContext(ctx)
@@ -741,7 +717,7 @@ func validateMeshConnectivity(ctx context.Context, cfg *Config, clients map[stri
 				return gCtx.Err()
 			}
 
-			// Ping all remote peers from this node.
+			var targets []pingTarget
 			for peerName, peer := range cfg.Nodes {
 				if peerName == name {
 					continue
@@ -749,17 +725,40 @@ func validateMeshConnectivity(ctx context.Context, cfg *Config, clients map[stri
 				if peer.IsDelete() || isLocalNode(peer) {
 					continue
 				}
+				targets = append(targets, pingTarget{
+					name: peerName,
+					ip:   peer.WireguardIP,
+				})
+			}
+			sort.Slice(targets, func(i, j int) bool {
+				return targets[i].name < targets[j].name
+			})
 
-				pingCmd := pingCommand(nc.osName, peer.WireguardIP)
-				out, err := sshRun(nc.ssh, pingCmd)
-				if err != nil {
-					debugInfo := gatherPingDebugInfo(cfg, clients, name, peerName, log)
-					return fmt.Errorf("ping from %s (%s) to %s (%s) failed: %w\n\n%s",
-						name, node.WireguardIP, peerName, peer.WireguardIP, err, debugInfo)
+			out, err := sshRun(nc.ssh, parallelPingCommand(nc.osName, targets))
+			if err != nil {
+				return fmt.Errorf("parallel ping from %s (%s) failed: %w\n%s",
+					name, node.WireguardIP, err, out)
+			}
+			for _, line := range strings.Split(out, "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
 				}
-
-				latency := parsePingLatency(out)
-				log.Info("ping ok", "from", name, "to", peerName, "ip", peer.WireguardIP, "latency", latency)
+				fields := strings.Split(line, "\t")
+				switch fields[0] {
+				case "OK":
+					if len(fields) < 4 {
+						continue
+					}
+					log.Info("ping ok", "from", name, "to", fields[1], "ip", fields[2], "latency", fields[3])
+				case "FAIL":
+					if len(fields) < 4 {
+						return fmt.Errorf("malformed ping failure from %s: %s", name, line)
+					}
+					debugInfo := gatherPingDebugInfo(cfg, clients, name, fields[1], log)
+					return fmt.Errorf("ping from %s (%s) to %s (%s) failed: exit status %s\n\n%s",
+						name, node.WireguardIP, fields[1], fields[2], fields[3], debugInfo)
+				}
 			}
 			return nil
 		})
@@ -768,11 +767,71 @@ func validateMeshConnectivity(ctx context.Context, cfg *Config, clients map[stri
 	return g.Wait()
 }
 
-func pingCommand(osName, ip string) string {
+type pingTarget struct {
+	name string
+	ip   string
+}
+
+func parallelPingCommand(osName string, targets []pingTarget) string {
+	timeout := "2"
 	if osName == "darwin" {
-		return fmt.Sprintf("ping -c 3 -W 2000 %s", ip)
+		timeout = "2000"
 	}
-	return fmt.Sprintf("ping -c 3 -W 2 %s", ip)
+
+	var b strings.Builder
+	b.WriteString(`set -u
+tmp="${TMPDIR:-/tmp}/limguard-ping-$$"
+mkdir -p "$tmp"
+cleanup() {
+    rm -rf "$tmp"
+}
+trap cleanup EXIT INT TERM
+
+run_ping() {
+    idx="$1"
+    peer="$2"
+    ip="$3"
+    out=$(ping -c 3 -W `)
+	b.WriteString(shellQuote(timeout))
+	b.WriteString(` "$ip" 2>&1)
+    ping_status=$?
+    if [ "$ping_status" -eq 0 ]; then
+        latency=$(printf '%s\n' "$out" | awk -F '=' '
+/min\/avg\/max|round-trip/ {
+    gsub(/^ +/, "", $2)
+    split($2, fields, " ")
+    split(fields[1], values, "/")
+    print values[2] " " fields[2]
+    found=1
+}
+END {
+    if (!found) {
+        print "unknown"
+    }
+}')
+        printf 'OK\t%s\t%s\t%s\n' "$peer" "$ip" "$latency" > "$tmp/$idx"
+    else
+        printf 'FAIL\t%s\t%s\t%s\n' "$peer" "$ip" "$ping_status" > "$tmp/$idx"
+    fi
+}
+
+`)
+	for i, target := range targets {
+		b.WriteString("run_ping ")
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString(" ")
+		b.WriteString(shellQuote(target.name))
+		b.WriteString(" ")
+		b.WriteString(shellQuote(target.ip))
+		b.WriteString(" &\n")
+	}
+	b.WriteString(`wait
+for f in "$tmp"/*; do
+    [ -f "$f" ] || continue
+    cat "$f"
+done
+`)
+	return "sh -c " + shellQuote(b.String())
 }
 
 // validateAllowedIPs checks that each node has:

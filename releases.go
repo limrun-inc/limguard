@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -33,9 +34,10 @@ type releaseInfo struct {
 type ReleaseDownloader struct {
 	cacheDir string
 	client   *http.Client
+	token    string
 
 	mu        sync.Mutex
-	releases  map[string]*releaseInfo   // cache by tag
+	releases  map[string]*releaseInfo      // cache by tag
 	checksums map[string]map[string]string // version -> (filename -> sha256)
 }
 
@@ -46,10 +48,11 @@ func NewReleaseDownloader() (*ReleaseDownloader, error) {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
 	return &ReleaseDownloader{
-		cacheDir:  cacheDir,
+		cacheDir: cacheDir,
 		// Use a timeout so we don't hang forever on stalled downloads.
 		// Context cancellation (Ctrl+C) will still abort immediately.
 		client:    &http.Client{Timeout: 5 * time.Minute},
+		token:     resolveGitHubToken(),
 		releases:  make(map[string]*releaseInfo),
 		checksums: make(map[string]map[string]string),
 	}, nil
@@ -299,13 +302,25 @@ func (d *ReleaseDownloader) downloadAsset(ctx context.Context, url, destPath str
 }
 
 func (d *ReleaseDownloader) addAuthHeader(req *http.Request) {
-	// Check for GitHub token in environment
+	if d.token != "" {
+		req.Header.Set("Authorization", "Bearer "+d.token)
+	}
+}
+
+func resolveGitHubToken() string {
 	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" {
 		token = os.Getenv("GH_TOKEN")
 	}
 	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		return token
 	}
-}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", "auth", "token").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
